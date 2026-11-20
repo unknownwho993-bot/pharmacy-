@@ -1,0 +1,5 @@
+[install]
+# better-sqlite3 needs node-gyp to compile its native addon, which is not
+# available in the Netlify build image. The static Vite build does not need
+# it, so skip dependency lifecycle scripts during install.
+ignoreScripts = true
