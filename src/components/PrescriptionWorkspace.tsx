@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   AlertTriangle,
   ArrowRight,
@@ -18,6 +18,7 @@ import type {
   PrescriptionLineItem,
 } from '../types';
 import { api } from '../lib/api';
+import { warmupBrowserOcr } from '../lib/staticCatalog';
 import {
   buildBudgetProposal,
   calculateLineItem,
@@ -101,7 +102,32 @@ export const PrescriptionWorkspace: React.FC<PrescriptionWorkspaceProps> = ({
   const [pickerLineId, setPickerLineId] = useState<string | null>(null);
   const [addingNewRowViaPicker, setAddingNewRowViaPicker] = useState(false);
 
+  // Detect static hosting (Netlify / public share) vs full-stack server
+  const [isStaticMode, setIsStaticMode] = useState<boolean>(() => api.isStaticMode());
+
+  useEffect(() => {
+    let active = true;
+    api.checkBackendAvailable().then((hasBackend) => {
+      if (!active) return;
+      const staticMode = !hasBackend;
+      setIsStaticMode(staticMode);
+      if (staticMode) {
+        warmupBrowserOcr();
+      }
+    });
+    return () => {
+      active = false;
+    };
+  }, []);
+
   const handleExtract = async (dataUrl: string, mime: string) => {
+    const hasBackend = await api.checkBackendAvailable();
+    if (!hasBackend) {
+      setIsStaticMode(true);
+      await handleExtractLocal(dataUrl, mime);
+      return;
+    }
+
     setIsExtracting(true);
     setExtractError(null);
     setStaffConfirmed(false);
@@ -383,6 +409,7 @@ export const PrescriptionWorkspace: React.FC<PrescriptionWorkspaceProps> = ({
             fileName={fileName}
             isExtracting={isExtracting}
             compactMode={lines.length > 0}
+            isStaticMode={isStaticMode}
             onFileSelected={(url, mime, name) => {
               setFileDataUrl(url);
               setMimeType(mime);

@@ -22,6 +22,7 @@ interface PrescriptionViewerProps {
   fileName: string | null;
   isExtracting: boolean;
   compactMode: boolean;
+  isStaticMode?: boolean;
   onFileSelected: (dataUrl: string, mimeType: string, fileName: string) => void;
   onClearFile: () => void;
   onExtract: (dataUrl: string, mimeType: string) => void;
@@ -41,6 +42,7 @@ export const PrescriptionViewer: React.FC<PrescriptionViewerProps> = ({
   fileName,
   isExtracting,
   compactMode,
+  isStaticMode = false,
   onFileSelected,
   onClearFile,
   onExtract,
@@ -93,7 +95,11 @@ export const PrescriptionViewer: React.FC<PrescriptionViewerProps> = ({
         if (typeof reader.result === 'string') {
           const dataUrl = reader.result;
           onFileSelected(dataUrl, 'image/jpeg', 'sample-dhaka-prescription.jpg');
-          onExtract(dataUrl, 'image/jpeg');
+          if (isStaticMode) {
+            onExtractLocal(dataUrl, 'image/jpeg');
+          } else {
+            onExtract(dataUrl, 'image/jpeg');
+          }
         }
         setLoadingSample(false);
       };
@@ -443,26 +449,40 @@ export const PrescriptionViewer: React.FC<PrescriptionViewerProps> = ({
               Original prescription remains visible for review.
             </span>
             <div className="flex flex-wrap items-center gap-2">
-              {!isPdf && (
+              {isStaticMode ? (
                 <button
                   type="button"
                   onClick={handleRunLocalOcr}
                   disabled={isExtracting || isCropping}
-                  className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg border border-slate-300 bg-white text-slate-800 text-xs font-medium hover:bg-slate-50 disabled:opacity-60 transition-colors cursor-pointer whitespace-nowrap shrink-0"
+                  className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-emerald-600 text-white text-xs sm:text-sm font-medium hover:bg-emerald-700 disabled:opacity-60 transition-colors cursor-pointer whitespace-nowrap shrink-0"
                 >
-                  <FileText className="w-3.5 h-3.5" />
-                  {isExtracting ? 'Scanning...' : 'Local OCR (No Key)'}
+                  <ScanLine className="w-4 h-4" />
+                  {isExtracting ? 'Scanning Prescription...' : 'Scan Prescription (Local OCR)'}
                 </button>
+              ) : (
+                <>
+                  {!isPdf && (
+                    <button
+                      type="button"
+                      onClick={handleRunLocalOcr}
+                      disabled={isExtracting || isCropping}
+                      className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg border border-slate-300 bg-white text-slate-800 text-xs font-medium hover:bg-slate-50 disabled:opacity-60 transition-colors cursor-pointer whitespace-nowrap shrink-0"
+                    >
+                      <FileText className="w-3.5 h-3.5" />
+                      {isExtracting ? 'Scanning...' : 'Local OCR (No Key)'}
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={handleRunScan}
+                    disabled={isExtracting || isCropping}
+                    className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-emerald-600 text-white text-xs sm:text-sm font-medium hover:bg-emerald-700 disabled:opacity-60 transition-colors cursor-pointer whitespace-nowrap shrink-0"
+                  >
+                    <ScanLine className="w-4 h-4" />
+                    {isExtracting ? 'Extracting...' : 'Extract with AI'}
+                  </button>
+                </>
               )}
-              <button
-                type="button"
-                onClick={handleRunScan}
-                disabled={isExtracting || isCropping}
-                className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-emerald-600 text-white text-xs sm:text-sm font-medium hover:bg-emerald-700 disabled:opacity-60 transition-colors cursor-pointer whitespace-nowrap shrink-0"
-              >
-                <ScanLine className="w-4 h-4" />
-                {isExtracting ? 'Extracting...' : 'Extract with AI'}
-              </button>
             </div>
           </div>
         </div>

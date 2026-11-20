@@ -713,6 +713,66 @@ function matchStrictInCatalog(
 
 let browserWorkerPromise: Promise<import('tesseract.js').Worker> | null = null;
 
+function getOrCreateBrowserWorker(): Promise<import('tesseract.js').Worker> {
+  if (!browserWorkerPromise) {
+    browserWorkerPromise = import('tesseract.js')
+      .then((mod) => mod.default.createWorker('eng'))
+      .catch((err) => {
+        browserWorkerPromise = null;
+        throw err;
+      });
+  }
+  return browserWorkerPromise;
+}
+
+/**
+ * Pre-warm browser Tesseract worker quietly so the first Local OCR scan is fast.
+ */
+export function warmupBrowserOcr(): void {
+  void getOrCreateBrowserWorker().catch(() => {});
+  void loadBaseCatalog().catch(() => {});
+}
+
+/**
+ * Gently boost contrast and convert prescription photo to crisp grayscale for faster, cleaner OCR.
+ */
+async function enhanceImageForOcr(dataUrl: string): Promise<string> {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => {
+      const canvas = document.createElement('canvas');
+      canvas.width = img.naturalWidth;
+      canvas.height = img.naturalHeight;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) {
+        resolve(dataUrl);
+        return;
+      }
+      ctx.drawImage(img, 0, 0);
+      try {
+        const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        const d = imgData.data;
+        const contrast = 1.25;
+        const intercept = 128 * (1 - contrast);
+        for (let i = 0; i < d.length; i += 4) {
+          const gray = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+          const v = Math.max(0, Math.min(255, gray * contrast + intercept));
+          d[i] = v;
+          d[i + 1] = v;
+          d[i + 2] = v;
+        }
+        ctx.putImageData(imgData, 0, 0);
+        resolve(canvas.toDataURL('image/png'));
+      } catch {
+        resolve(dataUrl);
+      }
+    };
+    img.onerror = () => resolve(dataUrl);
+    img.src = dataUrl;
+  });
+}
+
 export async function staticExtractPrescriptionLocal(
   imageBase64: string,
   mimeType: string
@@ -723,24 +783,16 @@ export async function staticExtractPrescriptionLocal(
     );
   }
 
-  const dataUrl = imageBase64.startsWith('data:')
+  const rawDataUrl = imageBase64.startsWith('data:')
     ? imageBase64
     : `data:${mimeType};base64,${imageBase64}`;
 
-  if (!browserWorkerPromise) {
-    browserWorkerPromise = import('tesseract.js')
-      .then((mod) => mod.default.createWorker('eng'))
-      .catch((err) => {
-        browserWorkerPromise = null;
-        throw err;
-      });
-  }
-
-  const [worker, catalog] = await Promise.all([
-    browserWorkerPromise,
+  const [worker, catalog, preparedImage] = await Promise.all([
+    getOrCreateBrowserWorker(),
     getMergedCatalog(),
+    enhanceImageForOcr(rawDataUrl),
   ]);
-  const { data } = await worker.recognize(dataUrl);
+  const { data } = await worker.recognize(preparedImage);
   const fullText = (data.text || '').trim();
 
   const rawLines = fullText
@@ -757,10 +809,35 @@ export async function staticExtractPrescriptionLocal(
     }
   }
 
+  // Build fast lowercase brand lookup set from all 25,703 MedEx brands (names >= 4 chars)
+  const knownBrands = new Set<string>();
+  for (let i = 0; i < catalog.length; i++) {
+    const b = catalog[i].brandName.trim().toLowerCase();
+    if (b.length >= 4 && !/^(tablet|capsule|syrup|cream|drops|water|plus|gold|extra|forte|max|pro)$/.test(b)) {
+      knownBrands.add(b);
+    }
+  }
+
   const formPattern =
     /\b(Tab\.?|Cap\.?|Syr\.?|Susp\.?|Inj\.?|Inhaler|Drops?|Cream|Oint\.?|Supp\.?|Powder|Sachet)\s+([A-Za-z][A-Za-z0-9\s-]{1,28}?)(?=\s+\d|\s*[—–-]|\s+\d\+\d|\s+(?:SOS|PRN|OD|BD|TDS|QID|HS)|$)/i;
   const strengthPattern =
     /(\d+(?:\.\d+)?\s*(?:mg|mcg|gm|g|ml|iu|%)(?:\/\d+(?:\.\d+)?\s*(?:ml|mg))?(?:\s*\+\s*\d+(?:\.\d+)?\s*(?:mg|mcg|gm|g|ml|iu|%))*)/i;
+
+  const findKnownBrandInLine = (line: string): string => {
+    const words = line
+      .replace(/[^A-Za-z0-9\s-]/g, ' ')
+      .split(/\s+/)
+      .filter((w) => w.length >= 4 && !/^\d/.test(w));
+    for (let i = 0; i < words.length; i++) {
+      if (i + 1 < words.length) {
+        const pair = `${words[i]} ${words[i + 1]}`.toLowerCase();
+        if (knownBrands.has(pair)) return `${words[i]} ${words[i + 1]}`;
+      }
+      const single = words[i].toLowerCase();
+      if (knownBrands.has(single)) return words[i];
+    }
+    return '';
+  };
 
   const groupedEntries: string[] = [];
   for (let i = 0; i < rawLines.length; i++) {
@@ -770,8 +847,9 @@ export async function staticExtractPrescriptionLocal(
       /\b\d(?:\/\d)?\+\d(?:\/\d)?\+\d(?:\/\d)?\b/.test(line) ||
       /\b(SOS|PRN|OD|BD|TDS|QID|HS)\b/.test(line);
     const hasStrength = strengthPattern.test(line);
+    const knownBrand = !hasForm ? findKnownBrandInLine(line) : '';
 
-    if (hasForm || (hasStrength && hasSchedule)) {
+    if (hasForm || (hasStrength && hasSchedule) || (knownBrand && (hasStrength || hasSchedule))) {
       let combined = line;
       if (i + 1 < rawLines.length) {
         const nextLine = rawLines[i + 1];
@@ -805,13 +883,16 @@ export async function staticExtractPrescriptionLocal(
       dosageForm = normalized.form;
       doseUnit = normalized.unit;
       brandName = formMatch[2].replace(/[^A-Za-z0-9\s-]/g, '').trim();
-    } else if (strengthMatch) {
-      const beforeStrength = entry
-        .slice(0, entry.indexOf(strengthMatch[1]))
-        .replace(/^[\d.\s©"']+/, '')
-        .replace(/[^A-Za-z0-9\s-]/g, ' ')
-        .trim();
-      brandName = beforeStrength.split(/\s+/).slice(-2).join(' ').trim();
+    } else {
+      brandName = findKnownBrandInLine(entry);
+      if (!brandName && strengthMatch) {
+        const beforeStrength = entry
+          .slice(0, entry.indexOf(strengthMatch[1]))
+          .replace(/^[\d.\s©"']+/, '')
+          .replace(/[^A-Za-z0-9\s-]/g, ' ')
+          .trim();
+        brandName = beforeStrength.split(/\s+/).slice(-2).join(' ').trim();
+      }
     }
 
     const strength = strengthMatch

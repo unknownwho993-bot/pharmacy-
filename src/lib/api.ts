@@ -27,6 +27,28 @@ class ApiUnavailableError extends Error {
 
 // Once a static-only public preview returns HTML 404 for /api/*, skip redundant network 404s
 let backendUnavailable = false;
+let backendCheckPromise: Promise<boolean> | null = null;
+
+async function probeBackend(): Promise<boolean> {
+  if (backendUnavailable) return false;
+  if (!backendCheckPromise) {
+    backendCheckPromise = (async () => {
+      try {
+        const res = await fetch('/api/health');
+        const ct = res.headers.get('content-type') || '';
+        if (!res.ok || !ct.includes('application/json')) {
+          backendUnavailable = true;
+          return false;
+        }
+        return true;
+      } catch {
+        backendUnavailable = true;
+        return false;
+      }
+    })();
+  }
+  return backendCheckPromise;
+}
 
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
   if (backendUnavailable) {
@@ -105,6 +127,10 @@ export interface MedexSyncStatusResponse {
 }
 
 export const api = {
+  isStaticMode: () => backendUnavailable,
+
+  checkBackendAvailable: () => probeBackend(),
+
   getDashboard: () =>
     withFallback(
       () => request<DashboardSummaryResponse>('/api/dashboard'),
