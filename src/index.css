@@ -1,0 +1,66 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    --font-sans: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+    --font-mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, monospace;
+  }
+
+  body {
+    font-family: var(--font-sans);
+    background-color: #f8fafc;
+    color: #0f172a;
+    overflow-x: hidden;
+  }
+
+  .font-mono-num {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+/* Clean print isolation for 58mm, 80mm thermal receipts and A4 invoices */
+@media print {
+  body * {
+    visibility: hidden;
+  }
+
+  #printable-invoice-area,
+  #printable-invoice-area * {
+    visibility: visible;
+  }
+
+  #printable-invoice-area {
+    position: fixed;
+    left: 0;
+    top: 0;
+    margin: 0;
+    padding: 0;
+    box-shadow: none !important;
+    border: none !important;
+    background: #ffffff !important;
+    color: #000000 !important;
+  }
+
+  #printable-invoice-area.print-58mm {
+    width: 58mm !important;
+    max-width: 58mm !important;
+    font-size: 10px !important;
+  }
+
+  #printable-invoice-area.print-80mm {
+    width: 80mm !important;
+    max-width: 80mm !important;
+    font-size: 11px !important;
+  }
+
+  #printable-invoice-area.print-a4 {
+    width: 210mm !important;
+    max-width: 100% !important;
+    padding: 12mm !important;
+  }
+
+  @page {
+    margin: 2mm;
+  }
+}

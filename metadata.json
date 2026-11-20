@@ -1,0 +1,6 @@
+{
+  "name": "ShifaRx POS",
+  "description": "AI-powered pharmacy prescription calculator, medicine pricing lookup, and POS billing system for pharmacies in Bangladesh.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
