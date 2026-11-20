@@ -79,6 +79,8 @@ export const PrescriptionWorkspace: React.FC<PrescriptionWorkspaceProps> = ({
 
   const [isExtracting, setIsExtracting] = useState(false);
   const [extractError, setExtractError] = useState<string | null>(null);
+  const [hasScanned, setHasScanned] = useState(false);
+  const [lastRawOcrText, setLastRawOcrText] = useState('');
 
   const [doctorName, setDoctorName] = useState('');
   const [patientName, setPatientName] = useState('');
@@ -138,6 +140,8 @@ export const PrescriptionWorkspace: React.FC<PrescriptionWorkspaceProps> = ({
       setPatientName(res.patientName || '');
       setPrescriptionNotes(res.notes || '');
       setLines(res.lines || []);
+      setLastRawOcrText(res.rawOcrText || '');
+      setHasScanned(true);
       setSelectedDurationDays(null);
     } catch (err) {
       setExtractError((err as Error).message);
@@ -157,6 +161,8 @@ export const PrescriptionWorkspace: React.FC<PrescriptionWorkspaceProps> = ({
       setPatientName(res.patientName || '');
       setPrescriptionNotes(res.notes || '');
       setLines(res.lines || []);
+      setLastRawOcrText(res.rawOcrText || '');
+      setHasScanned(true);
       setSelectedDurationDays(null);
     } catch (err) {
       setExtractError((err as Error).message);
@@ -415,12 +421,16 @@ export const PrescriptionWorkspace: React.FC<PrescriptionWorkspaceProps> = ({
               setMimeType(mime);
               setFileName(name);
               setExtractError(null);
+              setHasScanned(false);
+              setLastRawOcrText('');
             }}
             onClearFile={() => {
               setFileDataUrl(null);
               setMimeType(null);
               setFileName(null);
               setExtractError(null);
+              setHasScanned(false);
+              setLastRawOcrText('');
             }}
             onExtract={handleExtract}
             onExtractLocal={handleExtractLocal}
@@ -456,6 +466,48 @@ export const PrescriptionWorkspace: React.FC<PrescriptionWorkspaceProps> = ({
                 >
                   <Plus className="w-3.5 h-3.5" />
                   Enter Medicines Manually from MedEx DB
+                </button>
+              </div>
+            </div>
+          )}
+
+          {hasScanned && !isExtracting && !extractError && lines.length === 0 && (
+            <div className="mt-3 p-4 rounded-xl bg-amber-50 border border-amber-200 text-xs text-amber-950 space-y-3">
+              <div className="flex items-start gap-2.5">
+                <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5 text-amber-600" />
+                <div>
+                  <p className="font-semibold">
+                    No structured medicine lines auto-detected
+                  </p>
+                  <p className="mt-0.5 text-amber-900 leading-relaxed">
+                    {prescriptionNotes ||
+                      'Handwriting or low contrast can make Local OCR miss medicine names. Use the Crop tool above to tightly select only the Rx medicine list and scan again, or add medicines directly from the 25,703 MedEx database.'}
+                  </p>
+                </div>
+              </div>
+
+              {lastRawOcrText && (
+                <div className="bg-white border border-amber-200 rounded-lg p-2.5">
+                  <div className="text-[11px] font-medium text-slate-500 mb-1">
+                    Raw text read from prescription:
+                  </div>
+                  <pre className="text-[11px] font-mono text-slate-700 whitespace-pre-wrap max-h-36 overflow-y-auto">
+                    {lastRawOcrText}
+                  </pre>
+                </div>
+              )}
+
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setAddingNewRowViaPicker(true);
+                    setPickerLineId(null);
+                  }}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-emerald-600 text-white font-medium hover:bg-emerald-700 cursor-pointer"
+                >
+                  <Plus className="w-3.5 h-3.5" />
+                  Add Medicines from MedEx DB
                 </button>
               </div>
             </div>

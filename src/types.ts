@@ -198,6 +198,7 @@ export interface ExtractionResponse {
   prescriptionDate: string;
   notes: string;
   lines: PrescriptionLineItem[];
+  rawOcrText?: string;
 }
 
 export interface MedexLookupResult {

@@ -570,6 +570,16 @@ export function getAllMedicines(): MedicineRecord[] {
   return rows.map(mapMedicineRow);
 }
 
+let cachedServerBrandNames: string[] | null = null;
+export function getAllBrandNames(): string[] {
+  if (cachedServerBrandNames) return cachedServerBrandNames;
+  const rows = db
+    .prepare('SELECT DISTINCT brand_name FROM medicines')
+    .all() as Array<{ brand_name: string }>;
+  cachedServerBrandNames = rows.map((r) => r.brand_name);
+  return cachedServerBrandNames;
+}
+
 export function getMedicineById(id: number): MedicineRecord | null {
   const row = db.prepare('SELECT * FROM medicines WHERE id = ?').get(id) as Record<string, unknown> | undefined;
   return row ? mapMedicineRow(row) : null;

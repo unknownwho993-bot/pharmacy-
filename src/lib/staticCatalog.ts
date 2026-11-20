@@ -13,7 +13,8 @@ import type {
   MedexSyncStatusResponse,
   MedicineSearchResponse,
 } from './api';
-import { extractPdfContent } from './pdfExtract';
+import { extractPdfContent, renderPdfPagesToImages } from './pdfExtract';
+import { parsePrescriptionText } from './rxTextParser';
 
 interface CompactCatalogPayload {
   v: number;
@@ -557,148 +558,7 @@ export async function staticGetMedexSyncStatus(): Promise<MedexSyncStatusRespons
   };
 }
 
-// --- Client-side PDF + Browser Tesseract OCR + Bangladeshi (EN/BN) Rx Parser + Strict MedEx Matching ---
-const BENGALI_DIGIT_MAP: Record<string, string> = {
-  '০': '0',
-  '১': '1',
-  '২': '2',
-  '৩': '3',
-  '৪': '4',
-  '৫': '5',
-  '৬': '6',
-  '৭': '7',
-  '৮': '8',
-  '৯': '9',
-};
-
-function toLatinDigits(text: string): string {
-  return text.replace(/[০-৯]/g, (ch) => BENGALI_DIGIT_MAP[ch] ?? ch);
-}
-
-function normalizeFormToken(raw: string): { form: string; unit: string } {
-  const f = raw.toLowerCase().replace(/\./g, '').trim();
-  if (f.includes('cap')) return { form: 'Capsule', unit: 'capsule' };
-  if (f.includes('tab')) return { form: 'Tablet', unit: 'tablet' };
-  if (f.includes('syr')) return { form: 'Syrup', unit: 'ml' };
-  if (f.includes('susp')) return { form: 'Suspension', unit: 'ml' };
-  if (f.includes('sol') || f.includes('lotion')) return { form: 'Solution', unit: 'bottle' };
-  if (f.includes('gel')) return { form: 'Gel', unit: 'tube' };
-  if (f.includes('inj')) return { form: 'Injection', unit: 'vial' };
-  if (f.includes('inhal')) return { form: 'Inhaler', unit: 'puff' };
-  if (f.includes('drop')) return { form: 'Eye Drops', unit: 'drop' };
-  if (f.includes('cream')) return { form: 'Cream', unit: 'tube' };
-  if (f.includes('oint')) return { form: 'Ointment', unit: 'tube' };
-  if (f.includes('supp')) return { form: 'Suppository', unit: 'sachet' };
-  if (f.includes('powd') || f.includes('sach')) return { form: 'Powder', unit: 'sachet' };
-  return { form: 'Tablet', unit: 'tablet' };
-}
-
-function parseFrequencyFromText(rawText: string): {
-  frequencyCode: string;
-  frequencyPerDay: number | null;
-  isAsNeededOrVariable: boolean;
-  foundExplicit: boolean;
-} {
-  const text = toLatinDigits(rawText);
-
-  // Plus notation e.g. 0 + 0 + 1, 1 + 1/2 + 0, 1+0+1, 1+1+1
-  const plusMatch = text.match(
-    /(?:^|[^\d/])(\d(?:\/\d)?\s*\+\s*\d(?:\/\d)?\s*\+\s*\d(?:\/\d)?(?:\s*\+\s*\d(?:\/\d)?)?)(?:[^\d/]|$)/
-  );
-  if (plusMatch) {
-    const code = plusMatch[1].replace(/\s+/g, '');
-    const parts = code.split('+').map((p) => {
-      if (p.includes('/')) {
-        const [a, b] = p.split('/').map(Number);
-        return b > 0 ? a / b : 0;
-      }
-      return Number(p) || 0;
-    });
-    const sum = parts.reduce((acc, v) => acc + v, 0);
-    return {
-      frequencyCode: code,
-      frequencyPerDay: sum > 0 ? Number(sum.toFixed(2)) : null,
-      isAsNeededOrVariable: sum <= 0,
-      foundExplicit: true,
-    };
-  }
-
-  // Bengali daily counts: "দৈনিক ২ বার", "× ২ বার", "x 2 বার", "দিনে ৩ বার"
-  const bnTimesMatch = text.match(/(?:দৈনিক|দিনে|[×xX*])\s*(\d+)\s*বার/);
-  if (bnTimesMatch) {
-    const n = Number(bnTimesMatch[1]);
-    if (n === 1) return { frequencyCode: 'OD', frequencyPerDay: 1, isAsNeededOrVariable: false, foundExplicit: true };
-    if (n === 2) return { frequencyCode: 'BD', frequencyPerDay: 2, isAsNeededOrVariable: false, foundExplicit: true };
-    if (n === 3) return { frequencyCode: 'TDS', frequencyPerDay: 3, isAsNeededOrVariable: false, foundExplicit: true };
-    if (n === 4) return { frequencyCode: 'QID', frequencyPerDay: 4, isAsNeededOrVariable: false, foundExplicit: true };
-    if (n > 0) return { frequencyCode: `${n}x/day`, frequencyPerDay: n, isAsNeededOrVariable: false, foundExplicit: true };
-  }
-
-  if (/\b(SOS|PRN|as needed|when needed|tapering)\b/i.test(text) || /প্রয়োজনে/.test(text)) {
-    const m = text.match(/\b(SOS|PRN|tapering)\b/i);
-    return {
-      frequencyCode: m ? m[1].toUpperCase() : 'SOS',
-      frequencyPerDay: null,
-      isAsNeededOrVariable: true,
-      foundExplicit: true,
-    };
-  }
-  if (/\b(QID|4 times)\b/i.test(text)) return { frequencyCode: 'QID', frequencyPerDay: 4, isAsNeededOrVariable: false, foundExplicit: true };
-  if (/\b(TDS|TID|3 times|three times)\b/i.test(text)) return { frequencyCode: 'TDS', frequencyPerDay: 3, isAsNeededOrVariable: false, foundExplicit: true };
-  if (/\b(BD|BID|twice daily|2 times)\b/i.test(text)) return { frequencyCode: 'BD', frequencyPerDay: 2, isAsNeededOrVariable: false, foundExplicit: true };
-  if (/\b(OD|QD|once daily)\b/i.test(text)) return { frequencyCode: 'OD', frequencyPerDay: 1, isAsNeededOrVariable: false, foundExplicit: true };
-  if (/\b(HS|at night|bedtime)\b/i.test(text) || /রাতে/.test(text)) return { frequencyCode: 'HS', frequencyPerDay: 1, isAsNeededOrVariable: false, foundExplicit: true };
-  if (/\b(alternate day|EOD)\b/i.test(text)) return { frequencyCode: 'Alternate Day', frequencyPerDay: 0.5, isAsNeededOrVariable: false, foundExplicit: true };
-  if (/\b(weekly|once a week)\b/i.test(text) || /সপ্তাহে\s*1\s*বার/.test(text)) return { frequencyCode: 'Weekly', frequencyPerDay: 1 / 7, isAsNeededOrVariable: false, foundExplicit: true };
-
-  return { frequencyCode: '1+0+1', frequencyPerDay: 2, isAsNeededOrVariable: false, foundExplicit: false };
-}
-
-function parseDurationFromText(rawText: string): {
-  durationDays: number | null;
-  durationText: string;
-} {
-  const text = toLatinDigits(rawText);
-
-  const monthMatch = text.match(/(\d+)\s*(?:month|months|mon\b|মাস)/i);
-  if (monthMatch) {
-    const n = Number(monthMatch[1]);
-    return { durationDays: n * 30, durationText: `${n} month(s)` };
-  }
-  const weekMatch = text.match(/(\d+)\s*(?:week|weeks|wk\b|সপ্তাহ)/i);
-  if (weekMatch) {
-    const n = Number(weekMatch[1]);
-    return { durationDays: n * 7, durationText: `${n} week(s)` };
-  }
-  const dayMatch = text.match(/(\d{1,3})\s*(?:days?|da\b|d\b|দিন)/i);
-  if (dayMatch) {
-    const n = Number(dayMatch[1]);
-    if (n > 0 && n <= 365) {
-      return { durationDays: n, durationText: `${n} days` };
-    }
-  }
-  if (/চলবে|continue|ongoing/i.test(text)) {
-    return { durationDays: 30, durationText: 'Ongoing (চলবে)' };
-  }
-  return { durationDays: null, durationText: '' };
-}
-
-function parseInstructionsFromText(rawText: string): string {
-  const text = toLatinDigits(rawText);
-  const hints: string[] = [];
-  if (/\b(before\s*(?:meal|food)|AC)\b/i.test(text) || /(?:খাওয়ার|খাবারের)[^,\n]{0,18}আগে/.test(text)) {
-    hints.push('Before meal');
-  } else if (/\b(after\s*(?:meal|food)|PC)\b/i.test(text) || /(?:খাওয়ার|খাবারের)[^,\n]{0,18}পরে/.test(text)) {
-    hints.push('After meal');
-  }
-  if (/\b(at\s*night|bedtime|HS)\b/i.test(text) || /রাতে/.test(text)) {
-    hints.push('At night');
-  }
-  if (/মাথায় ব্যবহার/.test(text)) hints.push('Apply on scalp');
-  else if (/মাখবেন/.test(text)) hints.push('Apply topically');
-  return hints.join(', ');
-}
-
+// --- Client-side PDF + Browser Tesseract OCR + Strict MedEx Matching ---
 function matchStrictInCatalog(
   extracted: ExtractedMedicineRaw,
   catalog: MedicineRecord[]
@@ -814,26 +674,34 @@ export function warmupBrowserOcr(): void {
 }
 
 /**
- * Gently boost contrast and convert prescription photo to crisp grayscale for faster, cleaner OCR.
+ * Upscale small prescription images and apply crisp grayscale contrast boost for cleaner OCR.
  */
 async function enhanceImageForOcr(dataUrl: string): Promise<string> {
   return new Promise((resolve) => {
     const img = new Image();
     img.crossOrigin = 'anonymous';
     img.onload = () => {
+      // Upscale small images (< 1400px) so tiny medicine fonts become readable by Tesseract
+      const maxDim = Math.max(img.naturalWidth, img.naturalHeight);
+      const scale = maxDim < 1200 ? Math.min(2, 1500 / Math.max(1, maxDim)) : 1;
+      const w = Math.round(img.naturalWidth * scale);
+      const h = Math.round(img.naturalHeight * scale);
+
       const canvas = document.createElement('canvas');
-      canvas.width = img.naturalWidth;
-      canvas.height = img.naturalHeight;
+      canvas.width = w;
+      canvas.height = h;
       const ctx = canvas.getContext('2d');
       if (!ctx) {
         resolve(dataUrl);
         return;
       }
-      ctx.drawImage(img, 0, 0);
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = 'high';
+      ctx.drawImage(img, 0, 0, w, h);
       try {
         const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
         const d = imgData.data;
-        const contrast = 1.25;
+        const contrast = 1.28;
         const intercept = 128 * (1 - contrast);
         for (let i = 0; i < d.length; i += 4) {
           const gray = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
@@ -862,24 +730,50 @@ export async function staticExtractPrescriptionLocal(
     : `data:${mimeType};base64,${imageBase64}`;
 
   const catalog = await getMergedCatalog();
+  const knownBrandNames = catalog.map((m) => m.brandName);
+
   let fullText = '';
   let sourceLabel = 'Browser Local OCR';
+  let parsed = parsePrescriptionText('', knownBrandNames, sourceLabel);
 
   if (mimeType === 'application/pdf') {
     const pdfRes = await extractPdfContent(rawDataUrl);
     if (pdfRes.isDigitalText) {
       fullText = pdfRes.text;
       sourceLabel = 'PDF Digital Text Extraction';
-    } else if (pdfRes.pageImages.length > 0) {
-      const worker = await getOrCreateBrowserWorker();
-      const ocrPages: string[] = [];
-      for (const pageImg of pdfRes.pageImages) {
-        const enhanced = await enhanceImageForOcr(pageImg);
-        const { data } = await worker.recognize(enhanced);
-        if (data.text) ocrPages.push(data.text.trim());
+      parsed = parsePrescriptionText(fullText, knownBrandNames, sourceLabel);
+    }
+
+    // Hybrid or scanned PDF fallback: if digital text yielded 0 medicines, render pages and run Tesseract OCR!
+    if (parsed.medicines.length === 0) {
+      const pageImages =
+        pdfRes.pageImages.length > 0
+          ? pdfRes.pageImages
+          : await renderPdfPagesToImages(rawDataUrl, 2);
+
+      if (pageImages.length > 0) {
+        const worker = await getOrCreateBrowserWorker();
+        const ocrPages: string[] = [];
+        for (const pageImg of pageImages) {
+          const enhanced = await enhanceImageForOcr(pageImg);
+          const { data } = await worker.recognize(enhanced);
+          if (data.text) ocrPages.push(data.text.trim());
+        }
+        const ocrText = ocrPages.join('\n').trim();
+        if (ocrText) {
+          const prevHeader = {
+            doctorName: parsed.doctorName,
+            patientName: parsed.patientName,
+            prescriptionDate: parsed.prescriptionDate,
+          };
+          sourceLabel = 'PDF Scanned Page OCR';
+          parsed = parsePrescriptionText(ocrText, knownBrandNames, sourceLabel);
+          parsed.doctorName = parsed.doctorName || prevHeader.doctorName;
+          parsed.patientName = parsed.patientName || prevHeader.patientName;
+          parsed.prescriptionDate = parsed.prescriptionDate || prevHeader.prescriptionDate;
+          fullText = fullText ? `${fullText}\n---\n${ocrText}` : ocrText;
+        }
       }
-      fullText = ocrPages.join('\n').trim();
-      sourceLabel = 'PDF Scanned Page OCR';
     }
   } else {
     const [worker, preparedImage] = await Promise.all([
@@ -888,202 +782,14 @@ export async function staticExtractPrescriptionLocal(
     ]);
     const { data } = await worker.recognize(preparedImage);
     fullText = (data.text || '').trim();
+    parsed = parsePrescriptionText(fullText, knownBrandNames, sourceLabel);
   }
 
-  const rawLines = fullText
-    .split(/\r?\n/)
-    .map((l) => l.trim())
-    .filter((l) => l.length > 0);
-
-  let doctorName = '';
-  let patientName = '';
-  let prescriptionDate = '';
-
-  for (const line of rawLines) {
-    if (!doctorName) {
-      const docMatch = line.match(/\bDr\.?\s+[A-Za-z][A-Za-z.\s,()]{3,60}/);
-      if (docMatch) doctorName = docMatch[0].trim();
-    }
-    if (!patientName) {
-      const patMatch = line.match(/\b(?:Patient\s*)?Name\s*[:\-]\s*([A-Za-z.\s]{2,45}?)(?=\s+(?:Age|Sex|ID|Date|Mobile)|$)/i);
-      if (patMatch) patientName = patMatch[1].trim();
-    }
-    if (!prescriptionDate) {
-      const dateMatch = line.match(/\bDate\s*[:\-]\s*([0-9০-৯]{1,2}[/\-.][0-9০-৯]{1,2}[/\-.][0-9০-৯]{2,4})/i);
-      if (dateMatch) prescriptionDate = toLatinDigits(dateMatch[1].trim());
-    }
-  }
-
-  // Build fast lowercase brand lookup set from all 25,703 MedEx brands (names >= 4 chars)
-  const knownBrands = new Set<string>();
-  const STOP_BRAND_WORDS = new Set([
-    'tablet', 'capsule', 'syrup', 'cream', 'drops', 'water', 'plus', 'gold',
-    'extra', 'forte', 'max', 'pro', 'name', 'date', 'patient', 'address',
-    'chief', 'complaint', 'diagnosis', 'referred', 'years', 'irregular',
-    'fever', 'solution', 'lotion', 'ointment', 'powder', 'advice', 'history',
-    'follow', 'next', 'visit', 'days', 'month', 'months', 'week', 'weeks',
-    'daily', 'night', 'morning', 'before', 'after', 'meal', 'food', 'told',
-    'have', 'with', 'from', 'sherpur', 'dhaka',
-  ]);
-  for (let i = 0; i < catalog.length; i++) {
-    const b = catalog[i].brandName.trim().toLowerCase();
-    if (b.length >= 4 && !STOP_BRAND_WORDS.has(b)) {
-      knownBrands.add(b);
-    }
-  }
-
-  const formPrefixPattern =
-    /^(?:\d{1,2}[.)]\s*|[-•*]\s*)?(Tab\.?|Cap\.?|Syr\.?|Susp\.?|Inj\.?|Inhaler|Drops?|Cream|Oint\.?|Gel|Lotion|Solution|Supp\.?|Powder|Sachet)\s+([A-Za-z][A-Za-z0-9\s-]{1,28}?)(?=\s+\d+(?:\.\d+)?(?:\s*\/\s*\d+(?:\.\d+)?)?\s*(?:mg|mcg|gm|g|ml|iu|%)|\s*[—–-]|\s+\d\s*\+\s*\d|\s+(?:SOS|PRN|OD|BD|TDS|QID|HS)|\s+[\u0980-\u09FF]|$)/i;
-
-  const formSuffixPattern =
-    /\b(Tablet|Capsule|Syrup|Suspension|Solution|Scalp\s+Solution|Lotion|Cream|Ointment|Gel|Drops?|Inhaler|Injection|Powder|Sachet)\b/i;
-
-  const strengthPattern =
-    /(\d+(?:\.\d+)?(?:\s*\/\s*\d+(?:\.\d+)?)?\s*(?:mg|mcg|gm|g|ml|iu|%)(?:\/\d+(?:\.\d+)?\s*(?:ml|mg))?(?:\s*\+\s*\d+(?:\.\d+)?\s*(?:mg|mcg|gm|g|ml|iu|%))*)/i;
-
-  const findKnownBrandInLine = (line: string): string => {
-    const words = line
-      .replace(/[^A-Za-z0-9\s-]/g, ' ')
-      .split(/\s+/)
-      .filter((w) => w.length >= 4 && !/^\d/.test(w));
-    for (let i = 0; i < words.length; i++) {
-      if (i + 1 < words.length) {
-        const pair = `${words[i]} ${words[i + 1]}`.toLowerCase();
-        if (knownBrands.has(pair)) return `${words[i]} ${words[i + 1]}`;
-      }
-      const single = words[i].toLowerCase();
-      if (knownBrands.has(single)) return words[i];
-    }
-    return '';
-  };
-
-  const isMedicineStartLine = (line: string): boolean => {
-    const latin = toLatinDigits(line);
-    const hasPrefixForm = formPrefixPattern.test(latin);
-    const hasStrength = strengthPattern.test(latin);
-    const hasSchedule =
-      /\d(?:\/\d)?\s*\+\s*\d(?:\/\d)?\s*\+\s*\d(?:\/\d)?/.test(latin) ||
-      /\b(SOS|PRN|OD|BD|TDS|QID|HS)\b/.test(latin);
-    const isNumbered = /^\d{1,2}[.)]\s+[A-Za-z]/.test(latin);
-    const knownBrand = findKnownBrandInLine(latin);
-    const hasSuffixForm = formSuffixPattern.test(latin);
-
-    if (hasPrefixForm) return true;
-    if (isNumbered && (knownBrand || hasStrength || hasSuffixForm)) return true;
-    if (knownBrand && (hasStrength || hasSuffixForm || hasSchedule)) return true;
-    if (hasStrength && hasSchedule) return true;
-    return false;
-  };
-
-  const groupedEntries: string[] = [];
-  for (let i = 0; i < rawLines.length; i++) {
-    const line = rawLines[i];
-    if (isMedicineStartLine(line)) {
-      let combined = line;
-      // Attach up to 2 continuation lines (dosage schedule, duration, Bengali/English meal instructions)
-      let attached = 0;
-      while (i + 1 < rawLines.length && attached < 2) {
-        const nextLine = rawLines[i + 1];
-        const nextLatin = toLatinDigits(nextLine);
-        if (isMedicineStartLine(nextLine)) break;
-        if (/^\d{1,2}[.)]\s+/.test(nextLatin)) break;
-        if (/^(Chief Complaint|Diagnosis|Advice|Follow|Next Visit|Signature|Dr\.|Name\s*:)/i.test(nextLatin)) {
-          break;
-        }
-        const looksLikeDosageOrInstruction =
-          /\d(?:\/\d)?\s*\+\s*\d/.test(nextLatin) ||
-          /(?:চলবে|দিন|মাস|সপ্তাহ|বার|খাওয়ার|খাবারের|মাখবেন|ব্যবহার|আগে|পরে|রাতে|টি)/.test(nextLine) ||
-          /(meal|food|night|headache|pain|fever|before|after|days?|weeks?|months?|daily|SOS|PRN|OD|BD|TDS|QID|HS|\()/i.test(
-            nextLatin
-          );
-        if (!looksLikeDosageOrInstruction) break;
-        combined = `${combined} ${nextLine}`;
-        i++;
-        attached++;
-      }
-      groupedEntries.push(combined);
-    }
-  }
-
-  const extractedList: ExtractedMedicineRaw[] = groupedEntries.map((entry) => {
-    const latinEntry = toLatinDigits(entry);
-    const prefixMatch = latinEntry.match(formPrefixPattern);
-    const suffixMatch = latinEntry.match(formSuffixPattern);
-    const strengthMatch = latinEntry.match(strengthPattern);
-    const freq = parseFrequencyFromText(entry);
-    const dur = parseDurationFromText(entry);
-    const instructions = parseInstructionsFromText(entry);
-
-    let dosageForm = 'Tablet';
-    let doseUnit = 'tablet';
-    let brandName = '';
-
-    if (prefixMatch) {
-      const normalized = normalizeFormToken(prefixMatch[1]);
-      dosageForm = normalized.form;
-      doseUnit = normalized.unit;
-      brandName = prefixMatch[2].replace(/[^A-Za-z0-9\s-]/g, '').trim();
-    } else {
-      brandName = findKnownBrandInLine(latinEntry);
-      if (suffixMatch) {
-        const normalized = normalizeFormToken(suffixMatch[1]);
-        dosageForm = normalized.form;
-        doseUnit = normalized.unit;
-      }
-      if (!brandName && strengthMatch) {
-        const beforeStrength = latinEntry
-          .slice(0, latinEntry.indexOf(strengthMatch[1]))
-          .replace(/^[\d.\s©"']+/, '')
-          .replace(/[^A-Za-z0-9\s-]/g, ' ')
-          .trim();
-        brandName = beforeStrength.split(/\s+/).slice(-2).join(' ').trim();
-      }
-    }
-
-    // Clean accidental form word left inside brandName (e.g. "Vaniflo cream" -> "Vaniflo")
-    brandName = brandName
-      .replace(/\b(tablet|capsule|syrup|suspension|solution|cream|ointment|gel|lotion|drops?)\b/gi, '')
-      .replace(/\s+/g, ' ')
-      .trim();
-
-    const strength = strengthMatch
-      ? strengthMatch[1]
-          .replace(/\s*\/\s*/g, '/')
-          .replace(/(\d)(mg|mcg|gm|ml|iu)/gi, '$1 $2')
-          .trim()
-      : '';
-
-    const missingParts: string[] = [];
-    if (!brandName) missingParts.push('brand name');
-    if (!freq.isAsNeededOrVariable && dur.durationDays === null) missingParts.push('duration');
-
-    return {
-      rawText: entry,
-      brandName: brandName || 'Unclear Medicine',
-      genericName: '',
-      strength,
-      dosageForm,
-      dosePerIntake: 1,
-      doseUnit,
-      frequencyCode: freq.frequencyCode,
-      frequencyPerDay: freq.frequencyPerDay,
-      isAsNeededOrVariable: freq.isAsNeededOrVariable,
-      durationDays: dur.durationDays,
-      durationText: dur.durationText,
-      instructions,
-      explicitQuantity: null,
-      confidence: missingParts.length > 0 ? 'low' : 'medium',
-      uncertaintyReason:
-        missingParts.length > 0
-          ? `${sourceLabel} could not read ${missingParts.join(', ')} clearly — please verify against prescription.`
-          : `Extracted via ${sourceLabel} — please verify medicine name, dose, and duration.`,
-    };
-  });
-
-  const lines: PrescriptionLineItem[] = extractedList.map((raw, idx) => {
+  const lines: PrescriptionLineItem[] = parsed.medicines.map((raw, idx) => {
     const { matched, candidates, status } = matchStrictInCatalog(raw, catalog);
     const rawPrice = matched
-      ? matched.customUnitPrice ?? (matched.referenceUnitPrice > 0 ? matched.referenceUnitPrice : null)
+      ? matched.customUnitPrice ??
+        (matched.referenceUnitPrice > 0 ? matched.referenceUnitPrice : null)
       : null;
     const finalStatus: PriceMatchStatus =
       matched && rawPrice !== null
@@ -1141,13 +847,11 @@ export async function staticExtractPrescriptionLocal(
   });
 
   return {
-    doctorName,
-    patientName,
-    prescriptionDate,
-    notes:
-      lines.length > 0
-        ? `Extracted via ${sourceLabel}. Review every row against the original prescription.`
-        : `${sourceLabel} could not isolate structured medicine lines. Try cropping closely around the medicine list or add medicines manually.`,
+    doctorName: parsed.doctorName,
+    patientName: parsed.patientName,
+    prescriptionDate: parsed.prescriptionDate,
+    notes: parsed.notes,
     lines,
+    rawOcrText: fullText,
   };
 }

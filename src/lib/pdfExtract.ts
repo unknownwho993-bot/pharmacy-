@@ -2,7 +2,7 @@
  * Client-side PDF text & image extractor powered by pdfjs-dist.
  * - For digital PDFs (e.g., Bangladeshi clinic e-prescriptions): extracts exact Unicode text
  *   (including Bengali script & digits) with two-column layout awareness in < 100ms.
- * - For scanned image PDFs: renders pages onto canvas so Tesseract.js Local OCR can scan them.
+ * - For scanned or hybrid image PDFs: renders pages onto canvas so Tesseract.js Local OCR can scan them.
  */
 
 export interface ExtractedPdfResult {
@@ -33,7 +33,6 @@ function base64ToUint8Array(dataUrlOrBase64: string): Uint8Array {
 
 function groupItemsIntoLines(items: PositionedItem[]): string[] {
   if (items.length === 0) return [];
-  // PDF Y coordinates grow upward, so sort descending by Y (top -> bottom)
   const sorted = [...items].sort((a, b) => {
     if (Math.abs(b.y - a.y) > 4.5) return b.y - a.y;
     return a.x - b.x;
@@ -66,11 +65,11 @@ function reconstructPageText(items: PositionedItem[], pageWidth: number): string
 
   // Detect standard Bangladeshi two-column prescription where "Rx" starts in the right column
   const rxMarker = items.find(
-    (it) => /^Rx[,.:]?$/i.test(it.str.trim()) && it.x > pageWidth * 0.28
+    (it) => /\bRx[,.:]?$/i.test(it.str.trim()) && it.x > pageWidth * 0.22
   );
 
   if (rxMarker) {
-    const splitX = rxMarker.x - 14;
+    const splitX = rxMarker.x - 16;
     const rxY = rxMarker.y + 8;
 
     const headerItems = items.filter((it) => it.y > rxY);
@@ -88,19 +87,50 @@ function reconstructPageText(items: PositionedItem[], pageWidth: number): string
   return groupItemsIntoLines(items).join('\n');
 }
 
-export async function extractPdfContent(
-  dataUrlOrBase64: string
-): Promise<ExtractedPdfResult> {
+async function openPdfDocument(dataUrlOrBase64: string) {
   const [pdfjsLib, workerMod] = await Promise.all([
     import('pdfjs-dist'),
     import('pdfjs-dist/build/pdf.worker.min.mjs?url'),
   ]);
-
   pdfjsLib.GlobalWorkerOptions.workerSrc = workerMod.default;
-
   const bytes = base64ToUint8Array(dataUrlOrBase64);
-  const loadingTask = pdfjsLib.getDocument({ data: bytes });
-  const pdf = await loadingTask.promise;
+  return pdfjsLib.getDocument({ data: bytes }).promise;
+}
+
+export async function renderPdfPagesToImages(
+  dataUrlOrBase64: string,
+  maxPages = 2
+): Promise<string[]> {
+  const pdf = await openPdfDocument(dataUrlOrBase64);
+  const count = Math.min(pdf.numPages, maxPages);
+  const pageImages: string[] = [];
+
+  for (let p = 1; p <= count; p++) {
+    const page = await pdf.getPage(p);
+    const baseViewport = page.getViewport({ scale: 1.0 });
+    const targetScale = Math.min(
+      2.5,
+      1800 / Math.max(baseViewport.width, baseViewport.height)
+    );
+    const viewport = page.getViewport({ scale: Math.max(1.5, targetScale) });
+
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.round(viewport.width);
+    canvas.height = Math.round(viewport.height);
+    const ctx = canvas.getContext('2d');
+    if (ctx) {
+      await page.render({ canvas, canvasContext: ctx, viewport }).promise;
+      pageImages.push(canvas.toDataURL('image/png'));
+    }
+  }
+
+  return pageImages;
+}
+
+export async function extractPdfContent(
+  dataUrlOrBase64: string
+): Promise<ExtractedPdfResult> {
+  const pdf = await openPdfDocument(dataUrlOrBase64);
 
   const maxTextPages = Math.min(pdf.numPages, 4);
   const pageTexts: string[] = [];
@@ -138,26 +168,7 @@ export async function extractPdfContent(
     };
   }
 
-  // Scanned image PDF fallback: render first 1-2 pages to canvas for Tesseract OCR
-  const maxRenderPages = Math.min(pdf.numPages, 2);
-  const pageImages: string[] = [];
-
-  for (let p = 1; p <= maxRenderPages; p++) {
-    const page = await pdf.getPage(p);
-    const baseViewport = page.getViewport({ scale: 1.0 });
-    const targetScale = Math.min(2.2, 1600 / Math.max(baseViewport.width, baseViewport.height));
-    const viewport = page.getViewport({ scale: Math.max(1.2, targetScale) });
-
-    const canvas = document.createElement('canvas');
-    canvas.width = Math.round(viewport.width);
-    canvas.height = Math.round(viewport.height);
-    const ctx = canvas.getContext('2d');
-    if (ctx) {
-      await page.render({ canvas, canvasContext: ctx, viewport }).promise;
-      pageImages.push(canvas.toDataURL('image/jpeg', 0.88));
-    }
-  }
-
+  const pageImages = await renderPdfPagesToImages(dataUrlOrBase64, 2);
   return {
     text: combinedText,
     pageImages,

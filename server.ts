@@ -119,6 +119,7 @@ async function startServer() {
         prescriptionDate: raw.prescriptionDate,
         notes: raw.notes,
         lines,
+        rawOcrText: raw.rawOcrText,
       });
     } catch (err) {
       return res.status(422).json({
