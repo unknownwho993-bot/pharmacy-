@@ -151,15 +151,19 @@ export const api = {
       }
     ),
 
-  extractPrescriptionLocal: (imageBase64: string, mimeType: string) =>
-    withFallback(
+  extractPrescriptionLocal: (imageBase64: string, mimeType: string) => {
+    if (mimeType === 'application/pdf') {
+      return staticExtractPrescriptionLocal(imageBase64, mimeType);
+    }
+    return withFallback(
       () =>
         request<ExtractionResponse>('/api/prescriptions/ocr-local', {
           method: 'POST',
           body: JSON.stringify({ imageBase64, mimeType }),
         }),
       () => staticExtractPrescriptionLocal(imageBase64, mimeType)
-    ),
+    );
+  },
 
   searchMedicines: (params: {
     q?: string;

@@ -461,17 +461,15 @@ export const PrescriptionViewer: React.FC<PrescriptionViewerProps> = ({
                 </button>
               ) : (
                 <>
-                  {!isPdf && (
-                    <button
-                      type="button"
-                      onClick={handleRunLocalOcr}
-                      disabled={isExtracting || isCropping}
-                      className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg border border-slate-300 bg-white text-slate-800 text-xs font-medium hover:bg-slate-50 disabled:opacity-60 transition-colors cursor-pointer whitespace-nowrap shrink-0"
-                    >
-                      <FileText className="w-3.5 h-3.5" />
-                      {isExtracting ? 'Scanning...' : 'Local OCR (No Key)'}
-                    </button>
-                  )}
+                  <button
+                    type="button"
+                    onClick={handleRunLocalOcr}
+                    disabled={isExtracting || isCropping}
+                    className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg border border-slate-300 bg-white text-slate-800 text-xs font-medium hover:bg-slate-50 disabled:opacity-60 transition-colors cursor-pointer whitespace-nowrap shrink-0"
+                  >
+                    <FileText className="w-3.5 h-3.5" />
+                    {isExtracting ? 'Scanning...' : 'Local OCR (No Key)'}
+                  </button>
                   <button
                     type="button"
                     onClick={handleRunScan}

@@ -436,7 +436,7 @@ export const PrescriptionWorkspace: React.FC<PrescriptionWorkspaceProps> = ({
                 </div>
               </div>
               <div className="pl-6 flex flex-wrap items-center gap-2">
-                {fileDataUrl && mimeType && mimeType !== 'application/pdf' && (
+                {fileDataUrl && mimeType && (
                   <button
                     type="button"
                     disabled={isExtracting}

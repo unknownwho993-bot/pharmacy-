@@ -13,6 +13,7 @@ import type {
   MedexSyncStatusResponse,
   MedicineSearchResponse,
 } from './api';
+import { extractPdfContent } from './pdfExtract';
 
 interface CompactCatalogPayload {
   v: number;
@@ -223,17 +224,34 @@ function normalizeStrength(strength: string): string {
 
 function normalizeForm(form: string): string {
   const f = form.toLowerCase().trim();
-  if (f.startsWith('tab')) return 'tablet';
-  if (f.startsWith('cap')) return 'capsule';
-  if (f.startsWith('syr')) return 'syrup';
-  if (f.startsWith('susp')) return 'suspension';
-  if (f.startsWith('inj') || f.includes('vial') || f.includes('amp')) return 'injection';
+  if (f.includes('tab')) return 'tablet';
+  if (f.includes('cap')) return 'capsule';
+  if (f.includes('syr')) return 'syrup';
+  if (f.includes('susp')) return 'suspension';
+  if (f.includes('sol') || f.includes('lotion')) return 'solution';
+  if (f.includes('gel')) return 'gel';
+  if (f.includes('inj') || f.includes('vial') || f.includes('amp')) return 'injection';
   if (f.includes('inhal') || f.includes('puff')) return 'inhaler';
   if (f.includes('drop')) return 'eye drops';
   if (f.includes('cream')) return 'cream';
   if (f.includes('oint')) return 'ointment';
   if (f.includes('powd') || f.includes('sach')) return 'powder';
   return f;
+}
+
+function strengthsMatch(queryStrength: string, medStrength: string): boolean {
+  const qs = normalizeStrength(queryStrength);
+  const ms = normalizeStrength(medStrength);
+  if (!qs || !ms) return false;
+  if (ms === qs || ms.includes(qs) || qs.includes(ms)) return true;
+
+  // Match slash vs plus combinations e.g. "500/20mg" <-> "500mg+20mg"
+  const qNums = qs.match(/\d+(?:\.\d+)?/g) || [];
+  const mNums = ms.match(/\d+(?:\.\d+)?/g) || [];
+  if (qNums.length > 0 && qNums.length === mNums.length) {
+    return qNums.every((n, idx) => Number(n) === Number(mNums[idx]));
+  }
+  return false;
 }
 
 function levenshtein(a: string, b: string): number {
@@ -539,30 +557,53 @@ export async function staticGetMedexSyncStatus(): Promise<MedexSyncStatusRespons
   };
 }
 
-// --- Client-side Browser Tesseract OCR + Bangladeshi Rx Parser + Strict MedEx Matching ---
+// --- Client-side PDF + Browser Tesseract OCR + Bangladeshi (EN/BN) Rx Parser + Strict MedEx Matching ---
+const BENGALI_DIGIT_MAP: Record<string, string> = {
+  '০': '0',
+  '১': '1',
+  '২': '2',
+  '৩': '3',
+  '৪': '4',
+  '৫': '5',
+  '৬': '6',
+  '৭': '7',
+  '৮': '8',
+  '৯': '9',
+};
+
+function toLatinDigits(text: string): string {
+  return text.replace(/[০-৯]/g, (ch) => BENGALI_DIGIT_MAP[ch] ?? ch);
+}
+
 function normalizeFormToken(raw: string): { form: string; unit: string } {
   const f = raw.toLowerCase().replace(/\./g, '').trim();
-  if (f.startsWith('cap')) return { form: 'Capsule', unit: 'capsule' };
-  if (f.startsWith('tab')) return { form: 'Tablet', unit: 'tablet' };
-  if (f.startsWith('syr')) return { form: 'Syrup', unit: 'ml' };
-  if (f.startsWith('susp')) return { form: 'Suspension', unit: 'ml' };
-  if (f.startsWith('inj')) return { form: 'Injection', unit: 'vial' };
-  if (f.startsWith('inhal')) return { form: 'Inhaler', unit: 'puff' };
-  if (f.startsWith('drop')) return { form: 'Eye Drops', unit: 'drop' };
-  if (f.startsWith('cream')) return { form: 'Cream', unit: 'tube' };
-  if (f.startsWith('oint')) return { form: 'Ointment', unit: 'tube' };
-  if (f.startsWith('supp')) return { form: 'Suppository', unit: 'sachet' };
-  if (f.startsWith('powd') || f.startsWith('sach')) return { form: 'Powder', unit: 'sachet' };
+  if (f.includes('cap')) return { form: 'Capsule', unit: 'capsule' };
+  if (f.includes('tab')) return { form: 'Tablet', unit: 'tablet' };
+  if (f.includes('syr')) return { form: 'Syrup', unit: 'ml' };
+  if (f.includes('susp')) return { form: 'Suspension', unit: 'ml' };
+  if (f.includes('sol') || f.includes('lotion')) return { form: 'Solution', unit: 'bottle' };
+  if (f.includes('gel')) return { form: 'Gel', unit: 'tube' };
+  if (f.includes('inj')) return { form: 'Injection', unit: 'vial' };
+  if (f.includes('inhal')) return { form: 'Inhaler', unit: 'puff' };
+  if (f.includes('drop')) return { form: 'Eye Drops', unit: 'drop' };
+  if (f.includes('cream')) return { form: 'Cream', unit: 'tube' };
+  if (f.includes('oint')) return { form: 'Ointment', unit: 'tube' };
+  if (f.includes('supp')) return { form: 'Suppository', unit: 'sachet' };
+  if (f.includes('powd') || f.includes('sach')) return { form: 'Powder', unit: 'sachet' };
   return { form: 'Tablet', unit: 'tablet' };
 }
 
-function parseFrequencyFromText(text: string): {
+function parseFrequencyFromText(rawText: string): {
   frequencyCode: string;
   frequencyPerDay: number | null;
   isAsNeededOrVariable: boolean;
+  foundExplicit: boolean;
 } {
+  const text = toLatinDigits(rawText);
+
+  // Plus notation e.g. 0 + 0 + 1, 1 + 1/2 + 0, 1+0+1, 1+1+1
   const plusMatch = text.match(
-    /\b(\d(?:\/\d)?\s*\+\s*\d(?:\/\d)?\s*\+\s*\d(?:\/\d)?(?:\s*\+\s*\d(?:\/\d)?)?)\b/
+    /(?:^|[^\d/])(\d(?:\/\d)?\s*\+\s*\d(?:\/\d)?\s*\+\s*\d(?:\/\d)?(?:\s*\+\s*\d(?:\/\d)?)?)(?:[^\d/]|$)/
   );
   if (plusMatch) {
     const code = plusMatch[1].replace(/\s+/g, '');
@@ -578,55 +619,83 @@ function parseFrequencyFromText(text: string): {
       frequencyCode: code,
       frequencyPerDay: sum > 0 ? Number(sum.toFixed(2)) : null,
       isAsNeededOrVariable: sum <= 0,
+      foundExplicit: true,
     };
   }
-  if (/\b(SOS|PRN|as needed|when needed|tapering)\b/i.test(text)) {
+
+  // Bengali daily counts: "দৈনিক ২ বার", "× ২ বার", "x 2 বার", "দিনে ৩ বার"
+  const bnTimesMatch = text.match(/(?:দৈনিক|দিনে|[×xX*])\s*(\d+)\s*বার/);
+  if (bnTimesMatch) {
+    const n = Number(bnTimesMatch[1]);
+    if (n === 1) return { frequencyCode: 'OD', frequencyPerDay: 1, isAsNeededOrVariable: false, foundExplicit: true };
+    if (n === 2) return { frequencyCode: 'BD', frequencyPerDay: 2, isAsNeededOrVariable: false, foundExplicit: true };
+    if (n === 3) return { frequencyCode: 'TDS', frequencyPerDay: 3, isAsNeededOrVariable: false, foundExplicit: true };
+    if (n === 4) return { frequencyCode: 'QID', frequencyPerDay: 4, isAsNeededOrVariable: false, foundExplicit: true };
+    if (n > 0) return { frequencyCode: `${n}x/day`, frequencyPerDay: n, isAsNeededOrVariable: false, foundExplicit: true };
+  }
+
+  if (/\b(SOS|PRN|as needed|when needed|tapering)\b/i.test(text) || /প্রয়োজনে/.test(text)) {
     const m = text.match(/\b(SOS|PRN|tapering)\b/i);
     return {
       frequencyCode: m ? m[1].toUpperCase() : 'SOS',
       frequencyPerDay: null,
       isAsNeededOrVariable: true,
+      foundExplicit: true,
     };
   }
-  if (/\b(QID|4 times)\b/i.test(text)) return { frequencyCode: 'QID', frequencyPerDay: 4, isAsNeededOrVariable: false };
-  if (/\b(TDS|TID|3 times|three times)\b/i.test(text)) return { frequencyCode: 'TDS', frequencyPerDay: 3, isAsNeededOrVariable: false };
-  if (/\b(BD|BID|twice daily|2 times)\b/i.test(text)) return { frequencyCode: 'BD', frequencyPerDay: 2, isAsNeededOrVariable: false };
-  if (/\b(OD|QD|once daily)\b/i.test(text)) return { frequencyCode: 'OD', frequencyPerDay: 1, isAsNeededOrVariable: false };
-  if (/\b(HS|at night|bedtime)\b/i.test(text)) return { frequencyCode: 'HS', frequencyPerDay: 1, isAsNeededOrVariable: false };
-  if (/\b(alternate day|EOD)\b/i.test(text)) return { frequencyCode: 'Alternate Day', frequencyPerDay: 0.5, isAsNeededOrVariable: false };
-  if (/\b(weekly|once a week)\b/i.test(text)) return { frequencyCode: 'Weekly', frequencyPerDay: 1 / 7, isAsNeededOrVariable: false };
-  return { frequencyCode: '1+0+1', frequencyPerDay: 2, isAsNeededOrVariable: false };
+  if (/\b(QID|4 times)\b/i.test(text)) return { frequencyCode: 'QID', frequencyPerDay: 4, isAsNeededOrVariable: false, foundExplicit: true };
+  if (/\b(TDS|TID|3 times|three times)\b/i.test(text)) return { frequencyCode: 'TDS', frequencyPerDay: 3, isAsNeededOrVariable: false, foundExplicit: true };
+  if (/\b(BD|BID|twice daily|2 times)\b/i.test(text)) return { frequencyCode: 'BD', frequencyPerDay: 2, isAsNeededOrVariable: false, foundExplicit: true };
+  if (/\b(OD|QD|once daily)\b/i.test(text)) return { frequencyCode: 'OD', frequencyPerDay: 1, isAsNeededOrVariable: false, foundExplicit: true };
+  if (/\b(HS|at night|bedtime)\b/i.test(text) || /রাতে/.test(text)) return { frequencyCode: 'HS', frequencyPerDay: 1, isAsNeededOrVariable: false, foundExplicit: true };
+  if (/\b(alternate day|EOD)\b/i.test(text)) return { frequencyCode: 'Alternate Day', frequencyPerDay: 0.5, isAsNeededOrVariable: false, foundExplicit: true };
+  if (/\b(weekly|once a week)\b/i.test(text) || /সপ্তাহে\s*1\s*বার/.test(text)) return { frequencyCode: 'Weekly', frequencyPerDay: 1 / 7, isAsNeededOrVariable: false, foundExplicit: true };
+
+  return { frequencyCode: '1+0+1', frequencyPerDay: 2, isAsNeededOrVariable: false, foundExplicit: false };
 }
 
-function parseDurationFromText(text: string): {
+function parseDurationFromText(rawText: string): {
   durationDays: number | null;
   durationText: string;
 } {
-  const monthMatch = text.match(/\b(\d+)\s*(?:month|months|mon)\b/i);
+  const text = toLatinDigits(rawText);
+
+  const monthMatch = text.match(/(\d+)\s*(?:month|months|mon\b|মাস)/i);
   if (monthMatch) {
     const n = Number(monthMatch[1]);
     return { durationDays: n * 30, durationText: `${n} month(s)` };
   }
-  const weekMatch = text.match(/\b(\d+)\s*(?:week|weeks|wk)\b/i);
+  const weekMatch = text.match(/(\d+)\s*(?:week|weeks|wk\b|সপ্তাহ)/i);
   if (weekMatch) {
     const n = Number(weekMatch[1]);
     return { durationDays: n * 7, durationText: `${n} week(s)` };
   }
-  const dayMatch = text.match(/\b(\d{1,3})\s*(?:days?|da\b|d\b)/i);
+  const dayMatch = text.match(/(\d{1,3})\s*(?:days?|da\b|d\b|দিন)/i);
   if (dayMatch) {
     const n = Number(dayMatch[1]);
     if (n > 0 && n <= 365) {
       return { durationDays: n, durationText: `${n} days` };
     }
   }
+  if (/চলবে|continue|ongoing/i.test(text)) {
+    return { durationDays: 30, durationText: 'Ongoing (চলবে)' };
+  }
   return { durationDays: null, durationText: '' };
 }
 
-function parseInstructionsFromText(text: string): string {
+function parseInstructionsFromText(rawText: string): string {
+  const text = toLatinDigits(rawText);
   const hints: string[] = [];
-  if (/\b(before\s*(?:meal|food)|AC)\b/i.test(text)) hints.push('Before meal');
-  else if (/\b(after\s*(?:meal|food)|PC)\b/i.test(text)) hints.push('After meal');
-  if (/\b(at\s*night|bedtime|HS)\b/i.test(text)) hints.push('At night');
+  if (/\b(before\s*(?:meal|food)|AC)\b/i.test(text) || /(?:খাওয়ার|খাবারের)[^,\n]{0,18}আগে/.test(text)) {
+    hints.push('Before meal');
+  } else if (/\b(after\s*(?:meal|food)|PC)\b/i.test(text) || /(?:খাওয়ার|খাবারের)[^,\n]{0,18}পরে/.test(text)) {
+    hints.push('After meal');
+  }
+  if (/\b(at\s*night|bedtime|HS)\b/i.test(text) || /রাতে/.test(text)) {
+    hints.push('At night');
+  }
+  if (/মাথায় ব্যবহার/.test(text)) hints.push('Apply on scalp');
+  else if (/মাখবেন/.test(text)) hints.push('Apply topically');
   return hints.join(', ');
 }
 
@@ -639,11 +708,13 @@ function matchStrictInCatalog(
   status: PriceMatchStatus;
 } {
   const queryBrand = normalizeToken(extracted.brandName || '');
+  // Also try brand without trailing numeric suffix e.g. "Giane 35" -> "Giane"
+  const queryBrandBase = queryBrand.replace(/\s+\d+(?:\.\d+)?$/, '').trim();
   const queryGeneric = normalizeToken(extracted.genericName || '');
   const queryStrength = normalizeStrength(extracted.strength || '');
   const queryForm = normalizeForm(extracted.dosageForm || '');
 
-  const prefix = queryBrand.slice(0, 3);
+  const prefix = (queryBrandBase || queryBrand).slice(0, 3);
   const pool = catalog.filter((m) => {
     const b = m.brandName.toLowerCase();
     const g = m.genericName.toLowerCase();
@@ -657,27 +728,28 @@ function matchStrictInCatalog(
     .map((med) => {
       const medBrand = normalizeToken(med.brandName);
       const medGeneric = normalizeToken(med.genericName);
-      const medStrength = normalizeStrength(med.strength);
       const medForm = normalizeForm(med.dosageForm);
 
-      const brandSim = queryBrand ? similarity(queryBrand, medBrand) : 0;
+      const brandSim = Math.max(
+        queryBrand ? similarity(queryBrand, medBrand) : 0,
+        queryBrandBase ? similarity(queryBrandBase, medBrand) : 0
+      );
       const genericSim = queryGeneric ? similarity(queryGeneric, medGeneric) : 0;
       const crossSim = queryBrand ? similarity(queryBrand, medGeneric) : 0;
 
-      const exactBrand = queryBrand.length > 0 && queryBrand === medBrand;
+      const exactBrand =
+        (queryBrand.length > 0 && queryBrand === medBrand) ||
+        (queryBrandBase.length > 0 && queryBrandBase === medBrand);
       const exactStrength =
-        queryStrength.length > 0 &&
-        (medStrength === queryStrength ||
-          medStrength.includes(queryStrength) ||
-          queryStrength.includes(medStrength));
+        queryStrength.length > 0 && strengthsMatch(queryStrength, med.strength);
       const formMatches =
         !queryForm ||
         medForm === queryForm ||
         (queryForm === 'syrup' && medForm === 'suspension') ||
-        (queryForm === 'cream' && medForm === 'ointment');
+        (queryForm === 'cream' && (medForm === 'ointment' || medForm === 'gel'));
 
       let score = Math.max(brandSim * 0.72, genericSim * 0.55, crossSim * 0.52);
-      if (exactBrand) score += 0.2;
+      if (exactBrand) score += 0.22;
       if (exactStrength) score += 0.2;
       if (formMatches && queryForm) score += 0.1;
       if (med.referenceUnitPrice > 0 || med.customUnitPrice !== null) score += 0.04;
@@ -703,6 +775,14 @@ function matchStrictInCatalog(
       return { matched: null, candidates, status: 'needs_selection' };
     }
     return { matched: scored[0].med, candidates, status: 'verified' };
+  }
+
+  // If brand matched uniquely (e.g. Giane 35 -> only 1 Giane in MedEx) with matching form, match it cleanly
+  if (scored.length > 0 && scored[0].exactBrand) {
+    const exactBrandGroup = scored.filter((s) => s.exactBrand);
+    if (exactBrandGroup.length === 1) {
+      return { matched: scored[0].med, candidates, status: 'verified' };
+    }
   }
 
   if (candidates.length > 0) {
@@ -777,23 +857,38 @@ export async function staticExtractPrescriptionLocal(
   imageBase64: string,
   mimeType: string
 ): Promise<ExtractionResponse> {
-  if (mimeType === 'application/pdf') {
-    throw new Error(
-      'Local Browser OCR supports JPG/PNG images. Please upload a photo or screenshot of the prescription.'
-    );
-  }
-
   const rawDataUrl = imageBase64.startsWith('data:')
     ? imageBase64
     : `data:${mimeType};base64,${imageBase64}`;
 
-  const [worker, catalog, preparedImage] = await Promise.all([
-    getOrCreateBrowserWorker(),
-    getMergedCatalog(),
-    enhanceImageForOcr(rawDataUrl),
-  ]);
-  const { data } = await worker.recognize(preparedImage);
-  const fullText = (data.text || '').trim();
+  const catalog = await getMergedCatalog();
+  let fullText = '';
+  let sourceLabel = 'Browser Local OCR';
+
+  if (mimeType === 'application/pdf') {
+    const pdfRes = await extractPdfContent(rawDataUrl);
+    if (pdfRes.isDigitalText) {
+      fullText = pdfRes.text;
+      sourceLabel = 'PDF Digital Text Extraction';
+    } else if (pdfRes.pageImages.length > 0) {
+      const worker = await getOrCreateBrowserWorker();
+      const ocrPages: string[] = [];
+      for (const pageImg of pdfRes.pageImages) {
+        const enhanced = await enhanceImageForOcr(pageImg);
+        const { data } = await worker.recognize(enhanced);
+        if (data.text) ocrPages.push(data.text.trim());
+      }
+      fullText = ocrPages.join('\n').trim();
+      sourceLabel = 'PDF Scanned Page OCR';
+    }
+  } else {
+    const [worker, preparedImage] = await Promise.all([
+      getOrCreateBrowserWorker(),
+      enhanceImageForOcr(rawDataUrl),
+    ]);
+    const { data } = await worker.recognize(preparedImage);
+    fullText = (data.text || '').trim();
+  }
 
   const rawLines = fullText
     .split(/\r?\n/)
@@ -801,27 +896,50 @@ export async function staticExtractPrescriptionLocal(
     .filter((l) => l.length > 0);
 
   let doctorName = '';
+  let patientName = '';
+  let prescriptionDate = '';
+
   for (const line of rawLines) {
-    const docMatch = line.match(/\bDr\.?\s+[A-Za-z][A-Za-z.\s,()]{3,60}/);
-    if (docMatch) {
-      doctorName = docMatch[0].trim();
-      break;
+    if (!doctorName) {
+      const docMatch = line.match(/\bDr\.?\s+[A-Za-z][A-Za-z.\s,()]{3,60}/);
+      if (docMatch) doctorName = docMatch[0].trim();
+    }
+    if (!patientName) {
+      const patMatch = line.match(/\b(?:Patient\s*)?Name\s*[:\-]\s*([A-Za-z.\s]{2,45}?)(?=\s+(?:Age|Sex|ID|Date|Mobile)|$)/i);
+      if (patMatch) patientName = patMatch[1].trim();
+    }
+    if (!prescriptionDate) {
+      const dateMatch = line.match(/\bDate\s*[:\-]\s*([0-9০-৯]{1,2}[/\-.][0-9০-৯]{1,2}[/\-.][0-9০-৯]{2,4})/i);
+      if (dateMatch) prescriptionDate = toLatinDigits(dateMatch[1].trim());
     }
   }
 
   // Build fast lowercase brand lookup set from all 25,703 MedEx brands (names >= 4 chars)
   const knownBrands = new Set<string>();
+  const STOP_BRAND_WORDS = new Set([
+    'tablet', 'capsule', 'syrup', 'cream', 'drops', 'water', 'plus', 'gold',
+    'extra', 'forte', 'max', 'pro', 'name', 'date', 'patient', 'address',
+    'chief', 'complaint', 'diagnosis', 'referred', 'years', 'irregular',
+    'fever', 'solution', 'lotion', 'ointment', 'powder', 'advice', 'history',
+    'follow', 'next', 'visit', 'days', 'month', 'months', 'week', 'weeks',
+    'daily', 'night', 'morning', 'before', 'after', 'meal', 'food', 'told',
+    'have', 'with', 'from', 'sherpur', 'dhaka',
+  ]);
   for (let i = 0; i < catalog.length; i++) {
     const b = catalog[i].brandName.trim().toLowerCase();
-    if (b.length >= 4 && !/^(tablet|capsule|syrup|cream|drops|water|plus|gold|extra|forte|max|pro)$/.test(b)) {
+    if (b.length >= 4 && !STOP_BRAND_WORDS.has(b)) {
       knownBrands.add(b);
     }
   }
 
-  const formPattern =
-    /\b(Tab\.?|Cap\.?|Syr\.?|Susp\.?|Inj\.?|Inhaler|Drops?|Cream|Oint\.?|Supp\.?|Powder|Sachet)\s+([A-Za-z][A-Za-z0-9\s-]{1,28}?)(?=\s+\d|\s*[—–-]|\s+\d\+\d|\s+(?:SOS|PRN|OD|BD|TDS|QID|HS)|$)/i;
+  const formPrefixPattern =
+    /^(?:\d{1,2}[.)]\s*|[-•*]\s*)?(Tab\.?|Cap\.?|Syr\.?|Susp\.?|Inj\.?|Inhaler|Drops?|Cream|Oint\.?|Gel|Lotion|Solution|Supp\.?|Powder|Sachet)\s+([A-Za-z][A-Za-z0-9\s-]{1,28}?)(?=\s+\d+(?:\.\d+)?(?:\s*\/\s*\d+(?:\.\d+)?)?\s*(?:mg|mcg|gm|g|ml|iu|%)|\s*[—–-]|\s+\d\s*\+\s*\d|\s+(?:SOS|PRN|OD|BD|TDS|QID|HS)|\s+[\u0980-\u09FF]|$)/i;
+
+  const formSuffixPattern =
+    /\b(Tablet|Capsule|Syrup|Suspension|Solution|Scalp\s+Solution|Lotion|Cream|Ointment|Gel|Drops?|Inhaler|Injection|Powder|Sachet)\b/i;
+
   const strengthPattern =
-    /(\d+(?:\.\d+)?\s*(?:mg|mcg|gm|g|ml|iu|%)(?:\/\d+(?:\.\d+)?\s*(?:ml|mg))?(?:\s*\+\s*\d+(?:\.\d+)?\s*(?:mg|mcg|gm|g|ml|iu|%))*)/i;
+    /(\d+(?:\.\d+)?(?:\s*\/\s*\d+(?:\.\d+)?)?\s*(?:mg|mcg|gm|g|ml|iu|%)(?:\/\d+(?:\.\d+)?\s*(?:ml|mg))?(?:\s*\+\s*\d+(?:\.\d+)?\s*(?:mg|mcg|gm|g|ml|iu|%))*)/i;
 
   const findKnownBrandInLine = (line: string): string => {
     const words = line
@@ -839,37 +957,59 @@ export async function staticExtractPrescriptionLocal(
     return '';
   };
 
+  const isMedicineStartLine = (line: string): boolean => {
+    const latin = toLatinDigits(line);
+    const hasPrefixForm = formPrefixPattern.test(latin);
+    const hasStrength = strengthPattern.test(latin);
+    const hasSchedule =
+      /\d(?:\/\d)?\s*\+\s*\d(?:\/\d)?\s*\+\s*\d(?:\/\d)?/.test(latin) ||
+      /\b(SOS|PRN|OD|BD|TDS|QID|HS)\b/.test(latin);
+    const isNumbered = /^\d{1,2}[.)]\s+[A-Za-z]/.test(latin);
+    const knownBrand = findKnownBrandInLine(latin);
+    const hasSuffixForm = formSuffixPattern.test(latin);
+
+    if (hasPrefixForm) return true;
+    if (isNumbered && (knownBrand || hasStrength || hasSuffixForm)) return true;
+    if (knownBrand && (hasStrength || hasSuffixForm || hasSchedule)) return true;
+    if (hasStrength && hasSchedule) return true;
+    return false;
+  };
+
   const groupedEntries: string[] = [];
   for (let i = 0; i < rawLines.length; i++) {
     const line = rawLines[i];
-    const hasForm = formPattern.test(line);
-    const hasSchedule =
-      /\b\d(?:\/\d)?\+\d(?:\/\d)?\+\d(?:\/\d)?\b/.test(line) ||
-      /\b(SOS|PRN|OD|BD|TDS|QID|HS)\b/.test(line);
-    const hasStrength = strengthPattern.test(line);
-    const knownBrand = !hasForm ? findKnownBrandInLine(line) : '';
-
-    if (hasForm || (hasStrength && hasSchedule) || (knownBrand && (hasStrength || hasSchedule))) {
+    if (isMedicineStartLine(line)) {
       let combined = line;
-      if (i + 1 < rawLines.length) {
+      // Attach up to 2 continuation lines (dosage schedule, duration, Bengali/English meal instructions)
+      let attached = 0;
+      while (i + 1 < rawLines.length && attached < 2) {
         const nextLine = rawLines[i + 1];
-        if (
-          !formPattern.test(nextLine) &&
-          !strengthPattern.test(nextLine) &&
-          !/^\d+[.)]\s*/.test(nextLine) &&
-          /(meal|food|night|headache|pain|fever|before|after|\()/i.test(nextLine)
-        ) {
-          combined = `${line} ${nextLine}`;
-          i++;
+        const nextLatin = toLatinDigits(nextLine);
+        if (isMedicineStartLine(nextLine)) break;
+        if (/^\d{1,2}[.)]\s+/.test(nextLatin)) break;
+        if (/^(Chief Complaint|Diagnosis|Advice|Follow|Next Visit|Signature|Dr\.|Name\s*:)/i.test(nextLatin)) {
+          break;
         }
+        const looksLikeDosageOrInstruction =
+          /\d(?:\/\d)?\s*\+\s*\d/.test(nextLatin) ||
+          /(?:চলবে|দিন|মাস|সপ্তাহ|বার|খাওয়ার|খাবারের|মাখবেন|ব্যবহার|আগে|পরে|রাতে|টি)/.test(nextLine) ||
+          /(meal|food|night|headache|pain|fever|before|after|days?|weeks?|months?|daily|SOS|PRN|OD|BD|TDS|QID|HS|\()/i.test(
+            nextLatin
+          );
+        if (!looksLikeDosageOrInstruction) break;
+        combined = `${combined} ${nextLine}`;
+        i++;
+        attached++;
       }
       groupedEntries.push(combined);
     }
   }
 
   const extractedList: ExtractedMedicineRaw[] = groupedEntries.map((entry) => {
-    const formMatch = entry.match(formPattern);
-    const strengthMatch = entry.match(strengthPattern);
+    const latinEntry = toLatinDigits(entry);
+    const prefixMatch = latinEntry.match(formPrefixPattern);
+    const suffixMatch = latinEntry.match(formSuffixPattern);
+    const strengthMatch = latinEntry.match(strengthPattern);
     const freq = parseFrequencyFromText(entry);
     const dur = parseDurationFromText(entry);
     const instructions = parseInstructionsFromText(entry);
@@ -878,16 +1018,21 @@ export async function staticExtractPrescriptionLocal(
     let doseUnit = 'tablet';
     let brandName = '';
 
-    if (formMatch) {
-      const normalized = normalizeFormToken(formMatch[1]);
+    if (prefixMatch) {
+      const normalized = normalizeFormToken(prefixMatch[1]);
       dosageForm = normalized.form;
       doseUnit = normalized.unit;
-      brandName = formMatch[2].replace(/[^A-Za-z0-9\s-]/g, '').trim();
+      brandName = prefixMatch[2].replace(/[^A-Za-z0-9\s-]/g, '').trim();
     } else {
-      brandName = findKnownBrandInLine(entry);
+      brandName = findKnownBrandInLine(latinEntry);
+      if (suffixMatch) {
+        const normalized = normalizeFormToken(suffixMatch[1]);
+        dosageForm = normalized.form;
+        doseUnit = normalized.unit;
+      }
       if (!brandName && strengthMatch) {
-        const beforeStrength = entry
-          .slice(0, entry.indexOf(strengthMatch[1]))
+        const beforeStrength = latinEntry
+          .slice(0, latinEntry.indexOf(strengthMatch[1]))
           .replace(/^[\d.\s©"']+/, '')
           .replace(/[^A-Za-z0-9\s-]/g, ' ')
           .trim();
@@ -895,13 +1040,21 @@ export async function staticExtractPrescriptionLocal(
       }
     }
 
+    // Clean accidental form word left inside brandName (e.g. "Vaniflo cream" -> "Vaniflo")
+    brandName = brandName
+      .replace(/\b(tablet|capsule|syrup|suspension|solution|cream|ointment|gel|lotion|drops?)\b/gi, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+
     const strength = strengthMatch
-      ? strengthMatch[1].replace(/(\d)(mg|mcg|gm|ml|iu)/gi, '$1 $2').trim()
+      ? strengthMatch[1]
+          .replace(/\s*\/\s*/g, '/')
+          .replace(/(\d)(mg|mcg|gm|ml|iu)/gi, '$1 $2')
+          .trim()
       : '';
 
     const missingParts: string[] = [];
     if (!brandName) missingParts.push('brand name');
-    if (!strength) missingParts.push('strength');
     if (!freq.isAsNeededOrVariable && dur.durationDays === null) missingParts.push('duration');
 
     return {
@@ -922,8 +1075,8 @@ export async function staticExtractPrescriptionLocal(
       confidence: missingParts.length > 0 ? 'low' : 'medium',
       uncertaintyReason:
         missingParts.length > 0
-          ? `Local OCR could not read ${missingParts.join(', ')} clearly — please verify against prescription image.`
-          : 'Extracted via Browser Local OCR — please verify medicine name, dose, and duration.',
+          ? `${sourceLabel} could not read ${missingParts.join(', ')} clearly — please verify against prescription.`
+          : `Extracted via ${sourceLabel} — please verify medicine name, dose, and duration.`,
     };
   });
 
@@ -989,12 +1142,12 @@ export async function staticExtractPrescriptionLocal(
 
   return {
     doctorName,
-    patientName: '',
-    prescriptionDate: '',
+    patientName,
+    prescriptionDate,
     notes:
       lines.length > 0
-        ? 'Extracted via Browser Local OCR. Review every row against the original prescription image.'
-        : 'Local OCR could not isolate structured medicine lines. Try cropping closely around the medicine list or add medicines manually.',
+        ? `Extracted via ${sourceLabel}. Review every row against the original prescription.`
+        : `${sourceLabel} could not isolate structured medicine lines. Try cropping closely around the medicine list or add medicines manually.`,
     lines,
   };
 }
