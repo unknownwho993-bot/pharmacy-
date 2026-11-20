@@ -202,7 +202,7 @@ export default function App() {
     NAV_ITEMS.find((n) => n.id === activeTab)?.label || 'Dashboard';
 
   return (
-    <div className="min-h-screen flex bg-slate-50 text-slate-900">
+    <div className="min-h-screen flex bg-slate-50 text-slate-900 overflow-x-hidden">
       {/* Desktop Left Sidebar (240px) */}
       <aside className="hidden lg:flex lg:flex-col lg:w-60 lg:fixed lg:inset-y-0 bg-white border-r border-slate-200 z-30">
         <div className="h-16 px-5 border-b border-slate-200 flex items-center gap-2.5">

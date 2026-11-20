@@ -401,14 +401,14 @@ export const PrescriptionWorkspace: React.FC<PrescriptionWorkspaceProps> = ({
     : null;
 
   return (
-    <div className="space-y-6 pb-20 lg:pb-8">
+    <div className="space-y-6 pb-20 lg:pb-8 w-full max-w-full min-w-0">
       {/* Top Grid: Prescription Upload/Viewer + Context Header */}
       <div
-        className={`grid gap-6 ${
+        className={`grid gap-6 w-full min-w-0 ${
           lines.length > 0 ? 'lg:grid-cols-12 items-start' : 'grid-cols-1 max-w-3xl mx-auto'
         }`}
       >
-        <div className={lines.length > 0 ? 'lg:col-span-4 lg:sticky lg:top-20' : ''}>
+        <div className={`min-w-0 w-full ${lines.length > 0 ? 'lg:col-span-4 lg:sticky lg:top-20' : ''}`}>
           <PrescriptionViewer
             fileDataUrl={fileDataUrl}
             mimeType={mimeType}
@@ -472,14 +472,14 @@ export const PrescriptionWorkspace: React.FC<PrescriptionWorkspaceProps> = ({
           )}
 
           {hasScanned && !isExtracting && !extractError && lines.length === 0 && (
-            <div className="mt-3 p-4 rounded-xl bg-amber-50 border border-amber-200 text-xs text-amber-950 space-y-3">
-              <div className="flex items-start gap-2.5">
+            <div className="mt-3 p-4 rounded-xl bg-amber-50 border border-amber-200 text-xs text-amber-950 space-y-3 min-w-0 max-w-full">
+              <div className="flex items-start gap-2.5 min-w-0">
                 <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5 text-amber-600" />
-                <div>
+                <div className="min-w-0">
                   <p className="font-semibold">
                     No structured medicine lines auto-detected
                   </p>
-                  <p className="mt-0.5 text-amber-900 leading-relaxed">
+                  <p className="mt-0.5 text-amber-900 leading-relaxed break-words">
                     {prescriptionNotes ||
                       'Handwriting or low contrast can make Local OCR miss medicine names. Use the Crop tool above to tightly select only the Rx medicine list and scan again, or add medicines directly from the 25,703 MedEx database.'}
                   </p>
@@ -487,11 +487,11 @@ export const PrescriptionWorkspace: React.FC<PrescriptionWorkspaceProps> = ({
               </div>
 
               {lastRawOcrText && (
-                <div className="bg-white border border-amber-200 rounded-lg p-2.5">
+                <div className="bg-white border border-amber-200 rounded-lg p-2.5 min-w-0 max-w-full overflow-hidden">
                   <div className="text-[11px] font-medium text-slate-500 mb-1">
                     Raw text read from prescription:
                   </div>
-                  <pre className="text-[11px] font-mono text-slate-700 whitespace-pre-wrap max-h-36 overflow-y-auto">
+                  <pre className="text-[11px] font-mono text-slate-700 whitespace-pre-wrap break-words max-h-36 overflow-y-auto overflow-x-auto max-w-full">
                     {lastRawOcrText}
                   </pre>
                 </div>
@@ -514,7 +514,7 @@ export const PrescriptionWorkspace: React.FC<PrescriptionWorkspaceProps> = ({
           )}
 
           {lines.length === 0 && (
-            <div className="mt-4 flex items-center justify-between px-4 py-3 bg-white border border-slate-200 rounded-xl">
+            <div className="mt-4 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 px-4 py-3 bg-white border border-slate-200 rounded-xl min-w-0">
               <span className="text-sm text-slate-600">
                 Or enter prescription medicines manually without scanning
               </span>

@@ -116,7 +116,7 @@ export const PrescriptionViewer: React.FC<PrescriptionViewerProps> = ({
       const img = new Image();
       img.crossOrigin = 'anonymous';
       img.onload = () => {
-        const MAX_DIM = 1400;
+        const MAX_DIM = 2200;
         const rad = (rotation * Math.PI) / 180;
         const swap = rotation % 180 !== 0;
         const rotW = swap ? img.naturalHeight : img.naturalWidth;
@@ -128,7 +128,7 @@ export const PrescriptionViewer: React.FC<PrescriptionViewerProps> = ({
         const sw = applyCrop ? Math.max(40, Math.round(cropRect.w * rotW)) : rotW;
         const sh = applyCrop ? Math.max(40, Math.round(cropRect.h * rotH)) : rotH;
 
-        // Downscale large camera photos to max 1400px longest side for 3-5x faster upload & OCR
+        // Keep up to 2200px longest side so tiny printed medicine names stay sharp for OCR
         const scale = Math.min(1, MAX_DIM / Math.max(sw, sh));
         const outW = Math.max(1, Math.round(sw * scale));
         const outH = Math.max(1, Math.round(sh * scale));
@@ -150,13 +150,13 @@ export const PrescriptionViewer: React.FC<PrescriptionViewerProps> = ({
         outCanvas.height = outH;
         const oCtx = outCanvas.getContext('2d');
         if (!oCtx) {
-          resolve(rotCanvas.toDataURL('image/jpeg', 0.82));
+          resolve(rotCanvas.toDataURL('image/jpeg', 0.9));
           return;
         }
         oCtx.imageSmoothingEnabled = true;
         oCtx.imageSmoothingQuality = 'high';
         oCtx.drawImage(rotCanvas, sx, sy, sw, sh, 0, 0, outW, outH);
-        resolve(outCanvas.toDataURL('image/jpeg', 0.82));
+        resolve(outCanvas.toDataURL('image/jpeg', 0.9));
       };
       img.onerror = () => resolve(fileDataUrl);
       img.src = fileDataUrl;
@@ -218,7 +218,7 @@ export const PrescriptionViewer: React.FC<PrescriptionViewerProps> = ({
   };
 
   return (
-    <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
+    <div className="bg-white border border-slate-200 rounded-xl overflow-hidden w-full max-w-full min-w-0">
       {/* Hidden native inputs */}
       <input
         ref={fileInputRef}
@@ -420,7 +420,7 @@ export const PrescriptionViewer: React.FC<PrescriptionViewerProps> = ({
                     transform: `scale(${zoom}) rotate(${rotation}deg)`,
                     transformOrigin: 'center center',
                   }}
-                  className="max-h-[380px] w-auto object-contain rounded border border-slate-200 bg-white transition-transform duration-150"
+                  className="max-h-[380px] max-w-full w-auto object-contain rounded border border-slate-200 bg-white transition-transform duration-150"
                 />
                 {isCropping && (
                   <div
@@ -444,7 +444,7 @@ export const PrescriptionViewer: React.FC<PrescriptionViewerProps> = ({
           )}
 
           {/* Action Footer */}
-          <div className="px-4 py-3 border-t border-slate-200 bg-white flex flex-wrap items-center justify-between gap-2.5">
+          <div className="px-4 py-3 border-t border-slate-200 bg-white flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
             <span className="text-xs text-slate-500">
               Original prescription remains visible for review.
             </span>
@@ -454,7 +454,7 @@ export const PrescriptionViewer: React.FC<PrescriptionViewerProps> = ({
                   type="button"
                   onClick={handleRunLocalOcr}
                   disabled={isExtracting || isCropping}
-                  className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-emerald-600 text-white text-xs sm:text-sm font-medium hover:bg-emerald-700 disabled:opacity-60 transition-colors cursor-pointer whitespace-nowrap shrink-0"
+                  className="w-full sm:w-auto inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg bg-emerald-600 text-white text-xs sm:text-sm font-medium hover:bg-emerald-700 disabled:opacity-60 transition-colors cursor-pointer whitespace-nowrap shrink-0"
                 >
                   <ScanLine className="w-4 h-4" />
                   {isExtracting ? 'Scanning Prescription...' : 'Scan Prescription (Local OCR)'}

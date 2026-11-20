@@ -674,18 +674,60 @@ export function warmupBrowserOcr(): void {
 }
 
 /**
- * Upscale small prescription images and apply crisp grayscale contrast boost for cleaner OCR.
+ * Fast separable 3-tap Gaussian blur [1,2,1]/4 to wipe out LCD moiré stripes & sensor grain
+ * while keeping printed medicine characters intact.
  */
-async function enhanceImageForOcr(dataUrl: string): Promise<string> {
+function blurPass(src: Float32Array, dst: Float32Array, w: number, h: number): void {
+  const tmp = new Float32Array(w * h);
+  // Horizontal pass
+  for (let y = 0; y < h; y++) {
+    const row = y * w;
+    tmp[row] = (src[row] * 3 + src[row + Math.min(1, w - 1)]) * 0.25;
+    for (let x = 1; x < w - 1; x++) {
+      tmp[row + x] = (src[row + x - 1] + src[row + x] * 2 + src[row + x + 1]) * 0.25;
+    }
+    if (w > 1) {
+      tmp[row + w - 1] = (src[row + w - 2] + src[row + w - 1] * 3) * 0.25;
+    }
+  }
+  // Vertical pass
+  for (let x = 0; x < w; x++) {
+    dst[x] = (tmp[x] * 3 + tmp[Math.min(1, h - 1) * w + x]) * 0.25;
+    for (let y = 1; y < h - 1; y++) {
+      dst[y * w + x] = (tmp[(y - 1) * w + x] + tmp[y * w + x] * 2 + tmp[(y + 1) * w + x]) * 0.25;
+    }
+    if (h > 1) {
+      dst[(h - 1) * w + x] = (tmp[(h - 2) * w + x] + tmp[(h - 1) * w + x] * 3) * 0.25;
+    }
+  }
+}
+
+/**
+ * Upscale small prescription images, remove LCD screen moiré & uneven lighting via
+ * integral-image local background division, and output clean white-background grayscale PNG.
+ */
+async function enhanceImageForOcr(
+  dataUrl: string,
+  options?: { blurPasses?: number; lowLevel?: number; highLevel?: number }
+): Promise<string> {
+  const blurPasses = options?.blurPasses ?? 2;
+  const lowLevel = options?.lowLevel ?? 0.45;
+  const highLevel = options?.highLevel ?? 0.90;
+
   return new Promise((resolve) => {
     const img = new Image();
     img.crossOrigin = 'anonymous';
     img.onload = () => {
-      // Upscale small images (< 1400px) so tiny medicine fonts become readable by Tesseract
+      // Scale into the optimal 1800–2200px sweet spot for Tesseract LSTM
       const maxDim = Math.max(img.naturalWidth, img.naturalHeight);
-      const scale = maxDim < 1200 ? Math.min(2, 1500 / Math.max(1, maxDim)) : 1;
-      const w = Math.round(img.naturalWidth * scale);
-      const h = Math.round(img.naturalHeight * scale);
+      let scale = 1;
+      if (maxDim < 1600) {
+        scale = Math.min(2.6, 2000 / Math.max(1, maxDim));
+      } else if (maxDim > 2400) {
+        scale = 2200 / maxDim;
+      }
+      const w = Math.max(1, Math.round(img.naturalWidth * scale));
+      const h = Math.max(1, Math.round(img.naturalHeight * scale));
 
       const canvas = document.createElement('canvas');
       canvas.width = w;
@@ -698,18 +740,73 @@ async function enhanceImageForOcr(dataUrl: string): Promise<string> {
       ctx.imageSmoothingEnabled = true;
       ctx.imageSmoothingQuality = 'high';
       ctx.drawImage(img, 0, 0, w, h);
+
       try {
-        const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        const imgData = ctx.getImageData(0, 0, w, h);
         const d = imgData.data;
-        const contrast = 1.28;
-        const intercept = 128 * (1 - contrast);
-        for (let i = 0; i < d.length; i += 4) {
-          const gray = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
-          const v = Math.max(0, Math.min(255, gray * contrast + intercept));
-          d[i] = v;
-          d[i + 1] = v;
-          d[i + 2] = v;
+        const n = w * h;
+
+        let bufA = new Float32Array(n);
+        let bufB = new Float32Array(n);
+        for (let i = 0; i < n; i++) {
+          const off = i * 4;
+          bufA[i] = 0.299 * d[off] + 0.587 * d[off + 1] + 0.114 * d[off + 2];
         }
+
+        // 1-2 Gaussian passes eliminate high-frequency LCD monitor moiré grid lines
+        for (let p = 0; p < blurPasses; p++) {
+          blurPass(bufA, bufB, w, h);
+          const swap = bufA;
+          bufA = bufB;
+          bufB = swap;
+        }
+
+        // O(W*H) Summed-Area Table (Integral Image) for local background brightness
+        const stride = w + 1;
+        const integral = new Float64Array(stride * (h + 1));
+        for (let y = 0; y < h; y++) {
+          let rowSum = 0;
+          const srcRow = y * w;
+          const dstRow = (y + 1) * stride;
+          const prevRow = y * stride;
+          for (let x = 0; x < w; x++) {
+            rowSum += bufA[srcRow + x];
+            integral[dstRow + x + 1] = integral[prevRow + x + 1] + rowSum;
+          }
+        }
+
+        // Local background division + soft level stretch -> crisp white paper & dark anti-aliased ink
+        const radius = Math.max(18, Math.min(40, Math.round(Math.min(w, h) * 0.025)));
+        const invSpan = 1 / Math.max(0.05, highLevel - lowLevel);
+
+        for (let y = 0; y < h; y++) {
+          const y1 = Math.max(0, y - radius);
+          const y2 = Math.min(h - 1, y + radius);
+          const r1 = y1 * stride;
+          const r2 = (y2 + 1) * stride;
+          const srcRow = y * w;
+
+          for (let x = 0; x < w; x++) {
+            const x1 = Math.max(0, x - radius);
+            const x2 = Math.min(w - 1, x + radius);
+            const area = (y2 - y1 + 1) * (x2 - x1 + 1);
+            const sum =
+              integral[r2 + x2 + 1] -
+              integral[r1 + x2 + 1] -
+              integral[r2 + x1] +
+              integral[r1 + x1];
+            const localBg = Math.max(12, sum / area);
+            const ratio = bufA[srcRow + x] / localBg;
+            const norm = Math.max(0, Math.min(1, (ratio - lowLevel) * invSpan));
+            const v = Math.round(norm * 255);
+            const off = (srcRow + x) * 4;
+            d[off] = v;
+            d[off + 1] = v;
+            d[off + 2] = v;
+            d[off + 3] = 255;
+          }
+        }
+
         ctx.putImageData(imgData, 0, 0);
         resolve(canvas.toDataURL('image/png'));
       } catch {
@@ -776,13 +873,29 @@ export async function staticExtractPrescriptionLocal(
       }
     }
   } else {
-    const [worker, preparedImage] = await Promise.all([
+    const [worker, pass1Image] = await Promise.all([
       getOrCreateBrowserWorker(),
-      enhanceImageForOcr(rawDataUrl),
+      enhanceImageForOcr(rawDataUrl, { blurPasses: 2, lowLevel: 0.45, highLevel: 0.90 }),
     ]);
-    const { data } = await worker.recognize(preparedImage);
-    fullText = (data.text || '').trim();
+    const res1 = await worker.recognize(pass1Image);
+    fullText = (res1.data.text || '').trim();
     parsed = parsePrescriptionText(fullText, knownBrandNames, sourceLabel);
+
+    // Automatic Pass 2 fallback for faint ink or very fine print if Pass 1 found 0 medicines
+    if (parsed.medicines.length === 0) {
+      const pass2Image = await enhanceImageForOcr(rawDataUrl, {
+        blurPasses: 1,
+        lowLevel: 0.55,
+        highLevel: 0.88,
+      });
+      const res2 = await worker.recognize(pass2Image);
+      const text2 = (res2.data.text || '').trim();
+      const parsed2 = parsePrescriptionText(text2, knownBrandNames, sourceLabel);
+      if (parsed2.medicines.length > 0 || text2.length > fullText.length) {
+        fullText = text2;
+        parsed = parsed2;
+      }
+    }
   }
 
   const lines: PrescriptionLineItem[] = parsed.medicines.map((raw, idx) => {

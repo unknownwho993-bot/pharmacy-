@@ -31,7 +31,7 @@ export function toLatinDigits(text: string): string {
 function cleanOcrPrescriptionLine(rawLine: string): string {
   let s = toLatinDigits(rawLine);
   // Common OCR mistakes for Tab. / Cap. / Syr.
-  s = s.replace(/\b(?:Tah|1ab|lab|Teb|Tub)\.?(\s+[A-Z])/g, 'Tab.$1');
+  s = s.replace(/\b(?:Tah|Tat|Tob|1ab|lab|Teb|Tub)\.?(\s+[A-Z])/g, 'Tab.$1');
   s = s.replace(/\b(?:Cop|Cep|Gap)\.?(\s+[A-Z])/g, 'Cap.$1');
   s = s.replace(/\b(?:5yr|Svr)\.?(\s+[A-Z])/g, 'Syr.$1');
   // Common OCR mistakes inside schedules: 1+O+1, l+0+1, I+0+1
@@ -40,8 +40,11 @@ function cleanOcrPrescriptionLine(rawLine: string): string {
       v === 'O' || v === 'o' ? '0' : v === 'I' || v === 'l' || v === '|' ? '1' : v;
     return `${fix(a)}+${fix(b)}+${fix(c)}`;
   });
-  // Common OCR unit typos: 500mq / 500nq -> 500 mg
-  s = s.replace(/(\d)\s*(?:mq|nq)\b/gi, '$1 mg');
+  // Common OCR mistakes in strengths: "$ my" -> "5 mg", "300 my" -> "300 mg", "05 mg" -> "0.5 mg", "0.2% mg" -> "0.25 mg"
+  s = s.replace(/\$\s*(?:mg|my|mq|nq)\b/gi, '5 mg');
+  s = s.replace(/(\d+(?:\.\d+)?)\s*(?:mq|nq|my|rnq)\b/gi, '$1 mg');
+  s = s.replace(/\b0\.2%\s*mg\b/gi, '0.25 mg');
+  s = s.replace(/\b0([1-9])\s*mg\b/gi, '0.$1 mg');
   return s;
 }
 
@@ -175,55 +178,53 @@ function parseInstructionsFromText(rawText: string): string {
   return hints.join(', ');
 }
 
-function isWithinOneEdit(a: string, b: string): boolean {
-  if (Math.abs(a.length - b.length) > 1) return false;
-  let i = 0;
-  let j = 0;
-  let edits = 0;
-  while (i < a.length && j < b.length) {
-    if (a[i] === b[j]) {
-      i++;
-      j++;
-    } else {
-      edits++;
-      if (edits > 1) return false;
-      if (a.length > b.length) i++;
-      else if (b.length > a.length) j++;
-      else {
-        i++;
-        j++;
-      }
+function editDistanceCapped(a: string, b: string, maxDist: number): number {
+  if (Math.abs(a.length - b.length) > maxDist) return maxDist + 1;
+  const alen = a.length;
+  const blen = b.length;
+  let prev = new Array<number>(blen + 1);
+  let curr = new Array<number>(blen + 1);
+  for (let j = 0; j <= blen; j++) prev[j] = j;
+  for (let i = 1; i <= alen; i++) {
+    curr[0] = i;
+    let rowMin = i;
+    for (let j = 1; j <= blen; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      const val = Math.min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost);
+      curr[j] = val;
+      if (val < rowMin) rowMin = val;
     }
+    if (rowMin > maxDist) return maxDist + 1;
+    const tmp = prev;
+    prev = curr;
+    curr = tmp;
   }
-  if (i < a.length || j < b.length) edits++;
-  return edits <= 1;
+  return prev[blen];
 }
 
 const STOP_WORDS = new Set([
-  'tablet', 'capsule', 'syrup', 'cream', 'drops', 'water', 'plus', 'gold',
-  'extra', 'forte', 'max', 'pro', 'name', 'date', 'patient', 'address',
-  'chief', 'complaint', 'complaints', 'diagnosis', 'referred', 'years', 'year',
-  'irregular', 'fever', 'solution', 'lotion', 'ointment', 'powder', 'advice',
-  'history', 'follow', 'next', 'visit', 'days', 'month', 'months', 'week',
-  'weeks', 'daily', 'night', 'morning', 'before', 'after', 'meal', 'food',
-  'told', 'have', 'with', 'from', 'sherpur', 'dhaka', 'medical', 'hospital',
-  'clinic', 'chamber', 'doctor', 'medicine', 'consultation', 'severe',
-  'headache', 'pain', 'cough', 'cold', 'body', 'normal', 'test', 'tests',
-  'blood', 'sugar', 'pressure', 'weight', 'pulse', 'heart', 'lung', 'chest',
-  'high', 'low', 'mild', 'acute', 'chronic', 'female', 'male', 'phone',
-  'mobile', 'email', 'signature', 'road', 'house', 'bangladesh', 'limited',
-  'pharma', 'continue', 'ongoing', 'twice', 'once', 'thrice', 'times',
-  'pcos', 'mbbs', 'fcps', 'bcs', 'md', 'ms', 'ddv', 'dgo',
+  'the', 'and', 'for', 'with', 'from', 'after', 'before', 'meal', 'food', 'daily', 'days',
+  'day', 'week', 'weeks', 'month', 'months', 'night', 'morning', 'noon', 'evening', 'pain',
+  'fever', 'headache', 'tablet', 'tablets', 'capsule', 'capsules', 'syrup', 'drops', 'cream',
+  'solution', 'lotion', 'gel', 'injection', 'inhaler', 'powder', 'sachet', 'oral', 'continue',
+  'doctor', 'patient', 'name', 'age', 'sex', 'male', 'female', 'years', 'year', 'date',
+  'address', 'mobile', 'phone', 'hospital', 'medical', 'college', 'clinic', 'chamber',
+  'dhaka', 'bangladesh', 'chief', 'complaint', 'complaints', 'diagnosis', 'advice', 'advices',
+  'follow', 'followup', 'referred', 'visit', 'next', 'signature', 'medicine', 'medicines',
+  'regular', 'irregular', 'diabetes', 'endocrinology', 'history', 'normal', 'report',
+  'weight', 'height', 'pulse', 'pressure', 'blood', 'sugar', 'test', 'tests', 'take',
+  'twice', 'thrice', 'once', 'every', 'hours', 'hour', 'minutes', 'needed', 'water', 'liter',
+  'liters', 'exercise', 'sleep', 'avoid', 'sugar', 'salt', 'fatty', 'total', 'piece', 'strip',
 ]);
 
-// Famous 3-letter Bangladeshi brand names that can appear on prescriptions
 const SHORT_FAMOUS_BD_BRANDS = new Set([
-  'ace', 'fix', 'zin', 'noc', 'def', 'esl', 'ome', 'pan', 'cef', 'azi', 'met', 'los', 'aml',
+  'ace', 'max', 'fex', 'fix', 'zox', 'cipro', 'xpa', 'mon', 'nex', 'rol', 'eco', 'cal',
 ]);
 
 interface BrandIndex {
-  exact: Map<string, string>; // lower -> canonical brand name
-  byPrefix: Map<string, string[]>; // 2-char prefix -> canonical brand names (len >= 5)
+  exact: Map<string, string>;
+  byPrefix: Map<string, string[]>;
+  byFirstLetter: Map<string, string[]>;
 }
 
 let cachedBrandIndexKey = '';
@@ -237,6 +238,7 @@ function buildBrandIndex(knownBrandNames: string[]): BrandIndex {
 
   const exact = new Map<string, string>();
   const byPrefix = new Map<string, string[]>();
+  const byFirstLetter = new Map<string, string[]>();
 
   for (let i = 0; i < knownBrandNames.length; i++) {
     const raw = knownBrandNames[i].trim();
@@ -246,17 +248,24 @@ function buildBrandIndex(knownBrandNames: string[]): BrandIndex {
 
     if (!exact.has(low)) {
       exact.set(low, raw);
-      if (low.length >= 5 && /^[a-z]/.test(low)) {
+      if (low.length >= 4 && /^[a-z]/.test(low)) {
         const p = low.slice(0, 2);
         const bucket = byPrefix.get(p);
         if (bucket) bucket.push(raw);
         else byPrefix.set(p, [raw]);
+
+        if (low.length >= 6 && !low.includes(' ')) {
+          const ch = low[0];
+          const flBucket = byFirstLetter.get(ch);
+          if (flBucket) flBucket.push(raw);
+          else byFirstLetter.set(ch, [raw]);
+        }
       }
     }
   }
 
   cachedBrandIndexKey = key;
-  cachedBrandIndex = { exact, byPrefix };
+  cachedBrandIndex = { exact, byPrefix, byFirstLetter };
   return cachedBrandIndex;
 }
 
@@ -328,20 +337,54 @@ export function parsePrescriptionText(
       if (hit) return hit;
     }
 
-    // Pass 2: 1-character OCR typo fuzzy match for words >= 5 chars (e.g. "Inospiran" -> "Inospiron")
+    // Pass 2: OCR typo fuzzy match for words >= 5 chars (e.g. "Zokax" -> "Zolax", "Edyita" -> "Edysta", "Cabargel" -> "Cabergol", "Odrmvesan" -> "Olmesan")
     if (allowFuzzy) {
+      let bestMatch = '';
+      let bestScore = Infinity;
+
       for (const word of words) {
         const low = word.toLowerCase();
         if (low.length < 5 || STOP_WORDS.has(low) || !/^[a-z]/.test(low)) continue;
+
+        const maxDist = low.length >= 7 ? 2 : 1;
         const bucket = brandIndex.byPrefix.get(low.slice(0, 2));
-        if (!bucket) continue;
-        for (let j = 0; j < bucket.length; j++) {
-          const candLow = bucket[j].toLowerCase();
-          if (isWithinOneEdit(low, candLow)) {
-            return bucket[j];
+        if (bucket) {
+          for (let j = 0; j < bucket.length; j++) {
+            const candLow = bucket[j].toLowerCase();
+            if (candLow.includes(' ')) continue;
+            const d = editDistanceCapped(low, candLow, maxDist);
+            if (d <= maxDist) {
+              const score = d * 10 + Math.abs(low.length - candLow.length);
+              if (score < bestScore) {
+                bestScore = score;
+                bestMatch = bucket[j];
+              }
+            }
+          }
+        }
+
+        // Extra moire-resilient fallback for garbled middle letters when first char & last 3 chars match (e.g. Odrmvesan -> Olmesan)
+        if (!bestMatch && low.length >= 7) {
+          const flBucket = brandIndex.byFirstLetter.get(low[0]);
+          const suffix3 = low.slice(-3);
+          if (flBucket) {
+            for (let j = 0; j < flBucket.length; j++) {
+              const candLow = flBucket[j].toLowerCase();
+              if (candLow.length < 6 || !candLow.endsWith(suffix3)) continue;
+              const d = editDistanceCapped(low, candLow, 3);
+              if (d <= 3) {
+                const score = d * 10 + Math.abs(low.length - candLow.length);
+                if (score < bestScore) {
+                  bestScore = score;
+                  bestMatch = flBucket[j];
+                }
+              }
+            }
           }
         }
       }
+
+      if (bestMatch) return bestMatch;
     }
 
     return '';
