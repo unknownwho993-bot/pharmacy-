@@ -84,7 +84,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
         <div className="bg-white border border-slate-200 rounded-xl p-4">
           <div className="text-xs text-slate-500">Verified MedEx Catalog</div>
           <div className="font-mono-num text-2xl font-bold text-slate-900 mt-1">
-            {loading ? '—' : summary?.totalMedicines ?? 0}
+            {loading ? '—' : (summary?.totalMedicines ?? 0).toLocaleString()}
           </div>
           <div className="text-xs text-slate-500 mt-1">Bangladesh brands ready</div>
         </div>

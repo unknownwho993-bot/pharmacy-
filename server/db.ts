@@ -1,10 +1,32 @@
 import Database from 'better-sqlite3';
+import fs from 'fs';
 import path from 'path';
 import type { BillRecord, MedicineRecord, PharmacySettings, SellingRule } from '../src/types.ts';
 
-const dbPath = path.resolve(process.cwd(), 'pharmacy.db');
-const db = new Database(dbPath);
-db.pragma('journal_mode = WAL');
+function openWritableDatabase(): Database.Database {
+  const primaryPath = path.resolve(process.cwd(), 'pharmacy.db');
+  try {
+    const instance = new Database(primaryPath);
+    instance.pragma('journal_mode = WAL');
+    return instance;
+  } catch (err) {
+    // Cloud Run / read-only container fallback: copy bundled DB (if present) into /tmp
+    const fallbackPath = '/tmp/shifarx-pharmacy.db';
+    if (!fs.existsSync(fallbackPath) && fs.existsSync(primaryPath)) {
+      try {
+        fs.copyFileSync(primaryPath, fallbackPath);
+      } catch {
+        // Fresh DB will be seeded below
+      }
+    }
+    console.warn('[DB] Primary path unwritable, using /tmp fallback:', (err as Error).message);
+    const instance = new Database(fallbackPath);
+    instance.pragma('journal_mode = WAL');
+    return instance;
+  }
+}
+
+const db = openWritableDatabase();
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS medicines (
@@ -185,26 +207,150 @@ const SEED_MEDICINES: SeedMedicine[] = [
   { brand: 'Pevisone', generic: 'Econazole + Triamcinolone', strength: '1% + 0.1%', form: 'Cream', mfr: 'Square Pharmaceuticals PLC', packSize: 10, packUnit: 'tube', unitLabel: 'tube (10 gm)', unitPrice: 65.00, packPrice: 65.00, rule: 'tube', medexSlug: 'https://medex.com.bd/brands/13845/pevisone-cream' },
 ];
 
-// Seed medicines if table is empty
+// Hydrate full 25,703-medicine MedEx catalog from bundled JSON if DB starts fresh
+const RULE_FROM_CODE: SellingRule[] = [
+  'individual',
+  'strip',
+  'bottle',
+  'tube',
+  'inhaler',
+  'sachet',
+  'vial',
+];
+
+function deriveCatalogUnits(
+  rule: SellingRule,
+  dosageForm: string,
+  packSize: number
+): { packUnit: string; unitLabel: string } {
+  if (rule === 'bottle') {
+    return { packUnit: 'bottle', unitLabel: packSize > 1 ? `bottle (${packSize} ml)` : 'bottle' };
+  }
+  if (rule === 'tube') {
+    return { packUnit: 'tube', unitLabel: packSize > 1 ? `tube (${packSize} gm)` : 'tube' };
+  }
+  if (rule === 'inhaler') {
+    return { packUnit: 'inhaler', unitLabel: packSize > 1 ? `inhaler (${packSize} puffs)` : 'inhaler' };
+  }
+  if (rule === 'sachet') return { packUnit: 'sachet', unitLabel: 'sachet' };
+  if (rule === 'vial') return { packUnit: 'vial', unitLabel: 'vial' };
+  return {
+    packUnit: 'strip',
+    unitLabel: dosageForm.toLowerCase().includes('caps') ? 'capsule' : 'tablet',
+  };
+}
+
+function seedFromBundledMedexJson(): number {
+  const candidates = [
+    path.resolve(process.cwd(), 'dist/data/medex-catalog.json'),
+    path.resolve(process.cwd(), 'public/data/medex-catalog.json'),
+  ];
+  const jsonPath = candidates.find((p) => fs.existsSync(p));
+  if (!jsonPath) return 0;
+
+  try {
+    const raw = JSON.parse(fs.readFileSync(jsonPath, 'utf8')) as {
+      g: string[];
+      f: string[];
+      m: string[];
+      r: Array<
+        [number, string, number, string, number, number, number, number, number, number, string, string?]
+      >;
+    };
+    const insertStmt = db.prepare(`
+      INSERT INTO medicines (
+        brand_name, generic_name, strength, dosage_form, manufacturer,
+        pack_size, pack_unit, unit_label, reference_unit_price, reference_pack_price,
+        custom_unit_price, selling_rule, price_source, medex_url, last_verified_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)
+    `);
+    const existingUrls = new Set<string>(
+      (db.prepare('SELECT medex_url FROM medicines').all() as Array<{ medex_url: string }>).map(
+        (row) => row.medex_url
+      )
+    );
+
+    let inserted = 0;
+    const bulkTx = db.transaction(() => {
+      for (const row of raw.r) {
+        const [
+          ,
+          brand,
+          gIdx,
+          strength,
+          fIdx,
+          mIdx,
+          packSize,
+          refUnitPrice,
+          refPackPrice,
+          ruleCode,
+          slug,
+          verifiedDate,
+        ] = row;
+        const medexUrl = slug
+          ? slug.startsWith('http')
+            ? slug
+            : `https://medex.com.bd/brands/${slug}`
+          : 'https://medex.com.bd/';
+        if (existingUrls.has(medexUrl)) continue;
+        existingUrls.add(medexUrl);
+
+        const dosageForm = raw.f[fIdx] || 'Tablet';
+        const sellingRule = RULE_FROM_CODE[ruleCode] || 'individual';
+        const { packUnit, unitLabel } = deriveCatalogUnits(sellingRule, dosageForm, packSize);
+        const priceSource =
+          refUnitPrice > 0 ? 'MedEx Bangladesh' : 'MedEx Bangladesh (Fetch Price)';
+
+        insertStmt.run(
+          brand,
+          raw.g[gIdx] || '',
+          strength,
+          dosageForm,
+          raw.m[mIdx] || '',
+          packSize,
+          packUnit,
+          unitLabel,
+          refUnitPrice,
+          refPackPrice,
+          sellingRule,
+          priceSource,
+          medexUrl,
+          verifiedDate || ''
+        );
+        inserted++;
+      }
+    });
+    bulkTx();
+    console.log(`[DB] Auto-seeded ${inserted} MedEx medicines from ${path.basename(jsonPath)}`);
+    return inserted;
+  } catch (err) {
+    console.warn('[DB] Could not seed from bundled MedEx JSON:', (err as Error).message);
+    return 0;
+  }
+}
+
 const countRow = db.prepare('SELECT COUNT(*) as cnt FROM medicines').get() as { cnt: number };
-if (countRow.cnt === 0) {
-  const insertMed = db.prepare(`
-    INSERT INTO medicines (
-      brand_name, generic_name, strength, dosage_form, manufacturer,
-      pack_size, pack_unit, unit_label, reference_unit_price, reference_pack_price,
-      custom_unit_price, selling_rule, price_source, medex_url, last_verified_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, 'MedEx Bangladesh', ?, ?)
-  `);
-  const seedTx = db.transaction((items: SeedMedicine[]) => {
-    for (const m of items) {
-      insertMed.run(
-        m.brand, m.generic, m.strength, m.form, m.mfr,
-        m.packSize, m.packUnit, m.unitLabel, m.unitPrice, m.packPrice,
-        m.rule, m.medexSlug, VERIFIED_DATE
-      );
-    }
-  });
-  seedTx(SEED_MEDICINES);
+if (countRow.cnt < 500) {
+  const seededJsonCount = seedFromBundledMedexJson();
+  if (seededJsonCount === 0 && countRow.cnt === 0) {
+    const insertMed = db.prepare(`
+      INSERT INTO medicines (
+        brand_name, generic_name, strength, dosage_form, manufacturer,
+        pack_size, pack_unit, unit_label, reference_unit_price, reference_pack_price,
+        custom_unit_price, selling_rule, price_source, medex_url, last_verified_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, 'MedEx Bangladesh', ?, ?)
+    `);
+    const seedTx = db.transaction((items: SeedMedicine[]) => {
+      for (const m of items) {
+        insertMed.run(
+          m.brand, m.generic, m.strength, m.form, m.mfr,
+          m.packSize, m.packUnit, m.unitLabel, m.unitPrice, m.packPrice,
+          m.rule, m.medexSlug, VERIFIED_DATE
+        );
+      }
+    });
+    seedTx(SEED_MEDICINES);
+  }
 }
 
 // Seed default pharmacy settings if missing
